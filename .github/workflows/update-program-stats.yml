@@ -1,11 +1,7 @@
 name: Update Program Stats
 
 on:
-  schedule:
-    # 10分ごとに実行
-    - cron: "*/15 * * * *"
-
-  # GitHub画面から手動実行も可能
+  # GitHub画面から手動実行のみ
   workflow_dispatch:
 
 jobs:
