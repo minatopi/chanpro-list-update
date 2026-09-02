@@ -807,7 +807,7 @@ def create_notification(
             (
                 %s,
                 NULL,
-                'like',
+                'project',
                 NULL,
                 now(),
                 NULL,
