@@ -1,1243 +1,1160 @@
 import os
 import re
 import json
+import time
+import base64
 from datetime import datetime, timezone
 
 import psycopg
-from playwright.sync_api import sync_playwright
+import requests
+
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError
+)
 
 
 # ============================================================
-# PostgreSQL
+# 設定
 # ============================================================
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]
+GITHUB_FILE_PATH = os.environ.get(
+    "GITHUB_FILE_PATH",
+    "program_stats.json"
+)
 
-# ============================================================
-# 基本設定
-# ============================================================
+# GitHub API
+GITHUB_API_URL = (
+    f"https://api.github.com/repos/"
+    f"{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+)
 
-BASE_URL = "https://chanpro.jp"
+# ページ読み込み後の待機時間
+WAIT_AFTER_LOAD = 8000
 
-PROFILE_PAGE_WAIT = 5000
-PROGRAM_PAGE_WAIT = 3000
+# プロジェクトカード
+CARD_SELECTOR = "div.clickable-element"
 
-RESULT_FILE = "like_notification_result.json"
+# カードコンテナ
+CONTAINER_SELECTOR = (
+    "div.bubble-element.Group.baTcwaH1"
+)
 
-
-# ============================================================
-# URL正規化
-# ============================================================
-
-def normalize_url(url):
-    if not url:
-        return None
-
-    url = str(url).strip()
-
-    if not url:
-        return None
-
-    if url.startswith("/"):
-        return BASE_URL + url
-
-    return url
+# ローカルにも結果を保存
+OUTPUT_FILE = "result.json"
 
 
 # ============================================================
-# URLがプロフィールURLか
+# GitHub API
 # ============================================================
 
-def is_profile_url(url):
-    if not url:
-        return False
-
-    url = normalize_url(url)
-
-    return (
-        "/00-user-profile/" in url
-        or "/user-profile/" in url
-        or "user-profile" in url
-    )
-
-
-# ============================================================
-# URLがプログラムURLか
-# ============================================================
-
-def is_program_url(url):
-    if not url:
-        return False
-
-    url = normalize_url(url)
-
-    return (
-        "/00-program-profile/" in url
-        or "/program-profile/" in url
-        or "program-profile" in url
-    )
-
-
-# ============================================================
-# 数字を安全に整数へ
-# ============================================================
-
-def safe_int(value, default=0):
-
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-# ============================================================
-# プロフィールページからユーザー名を取得
-# ============================================================
-
-def get_profile_username(page):
-
-    """
-    プロフィール上部のユーザー名を取得。
-
-    例:
-        こうくん
-        みなと
-        test123
-
-    固定の名前は使用しない。
-    """
-
-    # --------------------------------------------------------
-    # サンプルHTMLでは、
-    #
-    # Group baTcyl1
-    #   └ Text
-    #       └ ユーザー名
-    #
-    # という構造になっている。
-    #
-    # Bubbleのクラス名は変わる可能性があるため、
-    # 複数の方法で探す。
-    # --------------------------------------------------------
-
-    candidates = []
-
-    # 方法1:
-    # プロフィール上部の比較的大きなGroupから探す
-    groups = page.locator(
-        "div.bubble-element.Group"
-    ).all()
-
-    for group in groups[:100]:
-
-        try:
-
-            text_elements = group.locator(
-                "div.bubble-element.Text"
-            ).all()
-
-            if not text_elements:
-                continue
-
-            for text_element in text_elements[:5]:
-
-                text = text_element.inner_text().strip()
-
-                if not text:
-                    continue
-
-                if "\n" in text:
-                    continue
-
-                if text in [
-                    "ログイン",
-                    "新規登録",
-                    "プロフィール",
-                ]:
-                    continue
-
-                if re.fullmatch(
-                    r"[\d,]+",
-                    text
-                ):
-                    continue
-
-                # 数字を大量に含むものは名前ではない可能性が高い
-                if len(re.findall(r"\d", text)) > 4:
-                    continue
-
-                # 極端に長い文章はプロフィール本文
-                if len(text) > 50:
-                    continue
-
-                candidates.append(text)
-
-        except Exception:
-            continue
-
-    # 最初の候補
-    if candidates:
-        return candidates[0]
-
-    # --------------------------------------------------------
-    # 最終手段
-    # --------------------------------------------------------
-
-    try:
-
-        texts = page.locator(
-            "div.bubble-element.Text"
-        ).all_inner_texts()
-
-        for text in texts:
-
-            text = text.strip()
-
-            if not text:
-                continue
-
-            if text in [
-                "ログイン",
-                "新規登録",
-                "プロフィール",
-            ]:
-                continue
-
-            if len(text) > 50:
-                continue
-
-            if re.fullmatch(
-                r"[\d,]+",
-                text
-            ):
-                continue
-
-            return text
-
-    except Exception:
-        pass
-
-    return None
-
-
-# ============================================================
-# プロフィールURLをプログラムページから探す
-# ============================================================
-
-def find_profile_url_from_program(
-    page,
-    program_url
-):
-
-    print(
-        f"プロフィールURL探索: {program_url}"
-    )
-
-    try:
-
-        page.goto(
-            program_url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
-        page.wait_for_timeout(
-            PROGRAM_PAGE_WAIT
-        )
-
-        # ----------------------------------------------------
-        # hrefを全部取得
-        # ----------------------------------------------------
-
-        links = page.locator(
-            "a[href]"
-        ).all()
-
-        for link in links:
-
-            try:
-
-                href = link.get_attribute(
-                    "href"
-                )
-
-                if not href:
-                    continue
-
-                href = normalize_url(href)
-
-                if is_profile_url(href):
-
-                    print(
-                        f"プロフィールURL発見: {href}"
-                    )
-
-                    return href
-
-            except Exception:
-                continue
-
-        # ----------------------------------------------------
-        # onclick等にURLが入っている可能性
-        # ----------------------------------------------------
-
-        html = page.content()
-
-        patterns = [
-            r'https://chanpro\.jp/[^"\']*user-profile[^"\']*',
-            r'/[^"\']*user-profile/[^"\']*',
-        ]
-
-        for pattern in patterns:
-
-            matches = re.findall(
-                pattern,
-                html
-            )
-
-            for match in matches:
-
-                url = normalize_url(match)
-
-                if is_profile_url(url):
-
-                    print(
-                        f"プロフィールURL発見: {url}"
-                    )
-
-                    return url
-
-    except Exception as e:
-
-        print(
-            f"プロフィールURL探索失敗: {e}"
-        )
-
-    return None
-
-
-# ============================================================
-# ユーザーのプロフィールURLを取得
-# ============================================================
-
-def get_user_profile_url(
-    page,
-    user
-):
-
-    # --------------------------------------------------------
-    # 1. users.profile にURLが入っている場合
-    # --------------------------------------------------------
-
-    profile = user.get("profile")
-
-    if profile:
-
-        profile = str(profile).strip()
-
-        if is_profile_url(profile):
-
-            return normalize_url(profile)
-
-        # profileそのものがURLなら使う
-        if profile.startswith("http"):
-
-            return normalize_url(profile)
-
-    # --------------------------------------------------------
-    # 2. program_urlsから探す
-    # --------------------------------------------------------
-
-    program_urls = user.get(
-        "program_urls"
-    ) or []
-
-    for program_url in program_urls:
-
-        program_url = normalize_url(
-            program_url
-        )
-
-        if not is_program_url(
-            program_url
-        ):
-            continue
-
-        profile_url = (
-            find_profile_url_from_program(
-                page,
-                program_url
-            )
-        )
-
-        if profile_url:
-            return profile_url
-
-    return None
-
-
-# ============================================================
-# プロジェクトカード解析
-# ============================================================
-
-def parse_card(
-    text,
-    profile_username=None
-):
-
-    """
-    プロジェクトカードから
-
-        title
-        like
-        views
-
-    を取得する。
-    """
-
-    lines = [
-        line.strip()
-        for line in text.split("\n")
-        if line.strip()
-    ]
-
-    if not lines:
-        return None
-
-    # --------------------------------------------------------
-    # プロフィールユーザー名を除外
-    # --------------------------------------------------------
-
-    if profile_username:
-
-        lines = [
-            line
-            for line in lines
-            if line != profile_username
-        ]
-
-    # --------------------------------------------------------
-    # 不要な文字
-    # --------------------------------------------------------
-
-    skip_exact = {
-        "ログイン",
-        "新規登録",
-        "プロフィール",
-    }
-
-    lines = [
-        line
-        for line in lines
-        if line not in skip_exact
-    ]
-
-    if not lines:
-        return None
-
-    # --------------------------------------------------------
-    # タイトル
-    # --------------------------------------------------------
-
-    title = lines[0]
-
-    # 数字取得
-    #
-    # 例:
-    #   19こ
-    #   275/1000
-    #
-    # → 19, 275, 1000
-    # --------------------------------------------------------
-
-    nums = re.findall(
-        r"\d[\d,]*",
-        text
-    )
-
-    numbers = [
-        safe_int(
-            n.replace(",", "")
-        )
-        for n in nums
-    ]
-
-    # --------------------------------------------------------
-    # 最低でもいいね数が必要
-    # --------------------------------------------------------
-
-    if len(numbers) == 0:
-        return None
-
-    likes = numbers[0]
-
-    views = (
-        numbers[1]
-        if len(numbers) >= 2
-        else 0
-    )
+def github_headers():
 
     return {
-        "title": title,
-        "like": likes,
-        "views": views,
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json"
     }
 
 
 # ============================================================
-# プロフィールから全プロジェクトを取得
+# GitHubから前回JSONを取得
 # ============================================================
 
-def scrape_profile(
-    page,
-    profile_url
-):
+def load_previous_stats():
 
     print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "プロフィール:",
-        profile_url
-    )
-
-    print(
-        "=" * 70
-    )
+    print("=" * 60)
+    print("GitHubから前回データを取得")
+    print("=" * 60)
 
     try:
 
-        page.goto(
-            profile_url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
-        page.wait_for_timeout(
-            PROFILE_PAGE_WAIT
+        response = requests.get(
+            GITHUB_API_URL,
+            headers=github_headers(),
+            timeout=30
         )
 
         # ----------------------------------------------------
-        # ユーザー名
+        # JSONがまだ存在しない
         # ----------------------------------------------------
 
-        username = (
-            get_profile_username(page)
+        if response.status_code == 404:
+
+            print(
+                "GitHubに前回JSONがありません。"
+            )
+
+            return {}, None
+
+        # ----------------------------------------------------
+        # その他エラー
+        # ----------------------------------------------------
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        encoded_content = data.get(
+            "content",
+            ""
+        )
+
+        sha = data.get(
+            "sha"
+        )
+
+        if not encoded_content:
+
+            print(
+                "GitHub JSONのcontentがありません。"
+            )
+
+            return {}, sha
+
+        # ----------------------------------------------------
+        # Base64デコード
+        # ----------------------------------------------------
+
+        decoded = base64.b64decode(
+            encoded_content
+        ).decode(
+            "utf-8"
+        )
+
+        previous_data = json.loads(
+            decoded
         )
 
         print(
-            "ユーザー名:",
-            username
+            f"前回データ取得成功: "
+            f"{len(previous_data.get('profiles', {}))}プロフィール"
         )
 
-        # ----------------------------------------------------
-        # プロジェクトコンテナ
-        # ----------------------------------------------------
-
-        container = page.locator(
-            "div.bubble-element.Group.baTcwaH1"
-        ).first
-
-        # ----------------------------------------------------
-        # 現在のHTML構造で見つからない場合、
-        # clickable-elementを全体から探す
-        # ----------------------------------------------------
-
-        if container.count() > 0:
-
-            cards = container.locator(
-                "div.clickable-element"
-            ).all()
-
-        else:
-
-            cards = page.locator(
-                "div.clickable-element"
-            ).all()
-
-        print(
-            "カード数:",
-            len(cards)
-        )
-
-        results = []
-
-        for index, card in enumerate(cards):
-
-            try:
-
-                text = card.inner_text()
-
-                parsed = parse_card(
-                    text,
-                    username
-                )
-
-                if not parsed:
-                    continue
-
-                # ------------------------------------------------
-                # カードのURLを取得
-                # ------------------------------------------------
-
-                card_url = None
-
-                # aタグ
-                try:
-
-                    link = card.locator(
-                        "a[href]"
-                    ).first
-
-                    if link.count() > 0:
-
-                        card_url = (
-                            link.get_attribute(
-                                "href"
-                            )
-                        )
-
-                except Exception:
-                    pass
-
-                # clickable自身
-                if not card_url:
-
-                    try:
-
-                        card_url = (
-                            card.get_attribute(
-                                "href"
-                            )
-                        )
-
-                    except Exception:
-                        pass
-
-                # ------------------------------------------------
-                # onclick等から探す
-                # ------------------------------------------------
-
-                if not card_url:
-
-                    try:
-
-                        outer_html = card.evaluate(
-                            "(el) => el.outerHTML"
-                        )
-
-                        matches = re.findall(
-                            r'https://chanpro\.jp/[^"\']*program-profile[^"\']*',
-                            outer_html
-                        )
-
-                        if matches:
-                            card_url = matches[0]
-
-                    except Exception:
-                        pass
-
-                card_url = normalize_url(
-                    card_url
-                )
-
-                parsed["url"] = card_url
-
-                results.append(
-                    parsed
-                )
-
-                print(
-                    f"[{index + 1}] "
-                    f"{parsed['title']} "
-                    f"いいね={parsed['like']} "
-                    f"閲覧={parsed['views']} "
-                    f"URL={card_url}"
-                )
-
-            except Exception as e:
-
-                print(
-                    f"カード {index + 1} "
-                    f"取得エラー: {e}"
-                )
-
-        return {
-            "username": username,
-            "projects": results,
-            "status": "success",
-        }
+        return previous_data, sha
 
     except Exception as e:
 
         print(
-            "プロフィール取得失敗:",
+            "GitHubからの取得に失敗しました:"
+        )
+
+        print(
             str(e)
         )
 
-        return {
-            "username": None,
-            "projects": [],
-            "status": "error",
-            "error": str(e),
-        }
+        raise
 
 
 # ============================================================
-# DBから全ユーザー取得
+# GitHubへJSON保存
 # ============================================================
 
-def get_all_users(conn):
-
-    with conn.cursor() as cur:
-
-        cur.execute(
-            """
-            SELECT
-                id,
-                username,
-                profile,
-                program_urls,
-                program_likes
-            FROM public.users
-            ORDER BY created_at ASC
-            """
-        )
-
-        rows = cur.fetchall()
-
-    users = []
-
-    for row in rows:
-
-        users.append({
-            "id": row[0],
-            "username": row[1],
-            "profile": row[2],
-            "program_urls": row[3] or [],
-            "program_likes": row[4] or [],
-        })
-
-    return users
-
-
-# ============================================================
-# 前回いいね数をURLから検索
-# ============================================================
-
-def get_old_like(
-    program_urls,
-    program_likes,
-    target_url
+def save_stats_to_github(
+    data,
+    sha=None
 ):
 
-    target_url = normalize_url(
-        target_url
+    print()
+    print("=" * 60)
+    print("GitHubへ新しいJSONを保存")
+    print("=" * 60)
+
+    content = json.dumps(
+        data,
+        ensure_ascii=False,
+        indent=2
     )
 
-    for index, url in enumerate(
-        program_urls
-    ):
+    encoded_content = base64.b64encode(
+        content.encode("utf-8")
+    ).decode("ascii")
 
-        url = normalize_url(url)
+    payload = {
+        "message": (
+            "Update program statistics "
+            + data["updated_at"]
+        ),
+        "content": encoded_content
+    }
 
-        if url == target_url:
+    # --------------------------------------------------------
+    # 既存ファイルの場合
+    # --------------------------------------------------------
 
-            if index < len(
-                program_likes
-            ):
+    if sha:
 
-                return safe_int(
-                    program_likes[index]
-                )
+        payload["sha"] = sha
 
-            return 0
+    try:
+
+        response = requests.put(
+            GITHUB_API_URL,
+            headers=github_headers(),
+            json=payload,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        print(
+            "GitHubへの保存成功"
+        )
+
+        print(
+            "commit:",
+            result.get("commit", {}).get("sha")
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "GitHubへの保存に失敗しました:"
+        )
+
+        print(
+            str(e)
+        )
+
+        raise
+
+
+# ============================================================
+# テキスト整形
+# ============================================================
+
+def clean_text(text):
+
+    if not text:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+
+# ============================================================
+# いいね数
+# ============================================================
+
+def extract_like(text):
+
+    if not text:
+        return 0
+
+    # --------------------------------------------------------
+    # 「19こ」
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"(\d+)\s*こ",
+        text
+    )
+
+    if match:
+
+        return int(
+            match.group(1)
+        )
 
     return 0
 
 
 # ============================================================
-# notificationsへ追加
+# 閲覧数
 # ============================================================
 
-def create_notification(
-    conn,
-    user_id,
-    program_url,
-    program_title,
-    old_likes,
-    new_likes
-):
+def extract_progress(text):
 
-    """
-    notificationsテーブルへ通知を作成。
+    if not text:
+        return 0, 0
 
-    actor_id:
-        NULL
-        → 「誰が押したか」ではなく、
-          外部プロフィールのいいね数増加を
-          検知した通知だから。
+    # --------------------------------------------------------
+    # 「275/1000」
+    # --------------------------------------------------------
 
-    post_id:
-        NULL
-        → program_urlはposts.idではないため。
+    match = re.search(
+        r"(\d+)\s*/\s*(\d+)",
+        text
+    )
 
-    message_id:
-        NULL
-    """
+    if match:
 
-    with conn.cursor() as cur:
-
-        cur.execute(
-            """
-            INSERT INTO public.notifications
-            (
-                user_id,
-                actor_id,
-                type,
-                post_id,
-                created_at,
-                message_id,
-                is_read
-            )
-            VALUES
-            (
-                %s,
-                NULL,
-                'project',
-                NULL,
-                now(),
-                NULL,
-                false
-            )
-            """,
-            (
-                user_id,
-            )
+        current = int(
+            match.group(1)
         )
 
-    difference = (
-        new_likes - old_likes
-    )
-
-    print()
-    print(
-        "★ 通知作成"
-    )
-
-    print(
-        "  ユーザー:",
-        user_id
-    )
-
-    print(
-        "  プロジェクト:",
-        program_title
-    )
-
-    print(
-        "  いいね:",
-        f"{old_likes} → {new_likes}"
-    )
-
-    print(
-        "  増加:",
-        f"+{difference}"
-    )
-
-    return True
-
-
-# ============================================================
-# program_likesを更新
-# ============================================================
-
-def update_program_likes(
-    conn,
-    user_id,
-    program_urls,
-    current_likes
-):
-
-    """
-    program_urlsの順番に合わせて
-    program_likesを作り直す。
-
-    取得できなかったURLについては
-    既存値を維持する。
-    """
-
-    new_likes = []
-
-    for url in program_urls:
-
-        normalized = normalize_url(
-            url
+        total = int(
+            match.group(2)
         )
 
-        # ----------------------------------------------------
-        # 今回取得できた
-        # ----------------------------------------------------
+        return current, total
 
-        if normalized in current_likes:
+    return 0, 0
 
-            new_likes.append(
-                current_likes[
-                    normalized
-                ]
+
+# ============================================================
+# カード解析
+# ============================================================
+
+def parse_card(card):
+
+    try:
+
+        text_elements = card.locator(
+            "div.bubble-element.Text"
+        ).all_inner_texts()
+
+        texts = []
+
+        for text in text_elements:
+
+            text = clean_text(
+                text
             )
 
-            continue
+            if text:
+
+                texts.append(
+                    text
+                )
+
+        if not texts:
+
+            return None
 
         # ----------------------------------------------------
-        # 今回取得できなかった
-        #
-        # 既存値を維持
+        # プロジェクト名
         # ----------------------------------------------------
 
-        old_index = None
+        title = texts[0]
 
-        for i, old_url in enumerate(
-            program_urls
-        ):
+        # ----------------------------------------------------
+        # いいね
+        # ----------------------------------------------------
 
-            if normalize_url(
-                old_url
-            ) == normalized:
+        like = 0
 
-                old_index = i
+        for text in texts:
+
+            value = extract_like(
+                text
+            )
+
+            if value:
+
+                like = value
+
                 break
 
-        if (
-            old_index is not None
-            and old_index >= 0
-        ):
+        # ----------------------------------------------------
+        # 閲覧数
+        # ----------------------------------------------------
 
-            # DBからの既存値は別途必要になるので
-            # この関数では呼び出し側で処理する。
-            new_likes.append(None)
+        views = 0
+        total = 0
 
-        else:
+        for text in texts:
 
-            new_likes.append(0)
-
-    # Noneを既存値に戻す
-    # --------------------------------------------------------
-
-    with conn.cursor() as cur:
-
-        cur.execute(
-            """
-            SELECT program_likes
-            FROM public.users
-            WHERE id = %s
-            """,
-            (
-                user_id,
+            current, max_value = (
+                extract_progress(
+                    text
+                )
             )
-        )
 
-        row = cur.fetchone()
+            if current or max_value:
 
-        old_likes = (
-            row[0] or []
-            if row
-            else []
-        )
+                views = current
+                total = max_value
 
-        for i in range(
-            len(new_likes)
-        ):
+                break
 
-            if new_likes[i] is None:
+        return {
+            "title": title,
+            "likes": like,
+            "views": views,
+            "total": total
+        }
 
-                if i < len(old_likes):
-
-                    new_likes[i] = (
-                        safe_int(
-                            old_likes[i]
-                        )
-                    )
-
-                else:
-
-                    new_likes[i] = 0
-
-        cur.execute(
-            """
-            UPDATE public.users
-            SET program_likes = %s
-            WHERE id = %s
-            """,
-            (
-                new_likes,
-                user_id
-            )
-        )
-
-
-# ============================================================
-# 1ユーザー処理
-# ============================================================
-
-def process_user(
-    conn,
-    page,
-    user
-):
-
-    user_id = user["id"]
-    username = user["username"]
-
-    print()
-    print()
-    print(
-        "#" * 70
-    )
-
-    print(
-        "ユーザー:",
-        username
-    )
-
-    print(
-        "ID:",
-        user_id
-    )
-
-    print(
-        "#" * 70
-    )
-
-    # --------------------------------------------------------
-    # プロフィールURL取得
-    # --------------------------------------------------------
-
-    profile_url = (
-        get_user_profile_url(
-            page,
-            user
-        )
-    )
-
-    if not profile_url:
+    except Exception as e:
 
         print(
-            "プロフィールURLを取得できませんでした"
+            "カード解析エラー:",
+            e
+        )
+
+        return None
+
+
+# ============================================================
+# プロフィール取得
+# ============================================================
+
+def scrape_profile(
+    page,
+    url
+):
+
+    print()
+    print("-" * 60)
+    print(
+        "プロフィール取得:",
+        url
+    )
+    print("-" * 60)
+
+    try:
+
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
+
+    except PlaywrightTimeoutError:
+
+        print(
+            "ページ読み込みタイムアウト"
+        )
+
+    except Exception as e:
+
+        print(
+            "ページ読み込みエラー:",
+            e
         )
 
         return {
-            "user_id": str(user_id),
-            "username": username,
-            "profile_url": None,
-            "status": "profile_url_not_found",
+            "url": url,
+            "status": "error",
             "projects": [],
-            "notifications": [],
+            "total_likes": None,
+            "total_views": None,
+            "error": str(e)
         }
+
+    # --------------------------------------------------------
+    # Bubble描画待ち
+    # --------------------------------------------------------
+
+    page.wait_for_timeout(
+        WAIT_AFTER_LOAD
+    )
+
+    # --------------------------------------------------------
+    # コンテナ取得
+    # --------------------------------------------------------
+
+    try:
+
+        container = page.locator(
+            CONTAINER_SELECTOR
+        ).first
+
+        container.wait_for(
+            state="visible",
+            timeout=30000
+        )
+
+    except PlaywrightTimeoutError:
+
+        print(
+            "カードコンテナが見つかりませんでした"
+        )
+
+        return {
+            "url": url,
+            "status": "error",
+            "projects": [],
+            "total_likes": None,
+            "total_views": None,
+            "error": "container not found"
+        }
+
+    # --------------------------------------------------------
+    # カード取得
+    # --------------------------------------------------------
+
+    cards = container.locator(
+        CARD_SELECTOR
+    )
+
+    card_count = cards.count()
 
     print(
-        "プロフィールURL:",
-        profile_url
+        f"プロジェクト数: {card_count}"
     )
 
-    # --------------------------------------------------------
-    # プロフィール取得
-    # --------------------------------------------------------
-
-    profile_data = scrape_profile(
-        page,
-        profile_url
-    )
-
-    if profile_data["status"] != "success":
-
-        return {
-            "user_id": str(user_id),
-            "username": username,
-            "profile_url": profile_url,
-            "status": "scrape_error",
-            "projects": [],
-            "notifications": [],
-        }
-
-    projects = (
-        profile_data["projects"]
-    )
+    projects = []
 
     # --------------------------------------------------------
-    # DBの前回値
+    # 各カード
     # --------------------------------------------------------
 
-    program_urls = (
-        user["program_urls"]
-        or []
-    )
+    for i in range(card_count):
 
-    program_likes = (
-        user["program_likes"]
-        or []
-    )
+        try:
 
-    # --------------------------------------------------------
-    # 現在のいいね数
-    # --------------------------------------------------------
+            card = cards.nth(i)
 
-    current_likes = {}
-
-    # --------------------------------------------------------
-    # 通知結果
-    # --------------------------------------------------------
-
-    notifications = []
-
-    # --------------------------------------------------------
-    # 各プロジェクトを処理
-    # --------------------------------------------------------
-
-    for project in projects:
-
-        project_url = normalize_url(
-            project.get("url")
-        )
-
-        project_title = (
-            project.get("title")
-            or "プロジェクト"
-        )
-
-        new_likes = safe_int(
-            project.get("like")
-        )
-
-        # ----------------------------------------------------
-        # URLが取得できた場合
-        # ----------------------------------------------------
-
-        if project_url:
-
-            current_likes[
-                project_url
-            ] = new_likes
-
-        # ----------------------------------------------------
-        # program_urlsから一致するものを探す
-        # ----------------------------------------------------
-
-        old_likes = None
-
-        if project_url:
-
-            old_likes = get_old_like(
-                program_urls,
-                program_likes,
-                project_url
+            parsed = parse_card(
+                card
             )
 
-        # ----------------------------------------------------
-        # URLがカードから取得できなかった場合
-        #
-        # program_urlsのタイトルとの直接照合はできないので、
-        # 順番を利用する。
-        # ----------------------------------------------------
+            if parsed:
 
-        if old_likes is None:
+                projects.append(
+                    parsed
+                )
 
-            project_index = (
-                projects.index(project)
-            )
-
-            if project_index < len(
-                program_likes
-            ):
-
-                old_likes = safe_int(
-                    program_likes[
-                        project_index
-                    ]
+                print(
+                    f"[{i + 1}/{card_count}] "
+                    f"{parsed['title']} "
+                    f"like={parsed['likes']} "
+                    f"views={parsed['views']}"
                 )
 
             else:
 
-                old_likes = 0
+                print(
+                    f"[{i + 1}/{card_count}] "
+                    "解析できませんでした"
+                )
 
-        # ----------------------------------------------------
-        # 増加チェック
-        # ----------------------------------------------------
+        except Exception as e:
 
-        print()
-        print(
-            f"プロジェクト: {project_title}"
+            print(
+                f"[{i + 1}/{card_count}] "
+                f"エラー: {e}"
+            )
+
+    # --------------------------------------------------------
+    # 合計
+    # --------------------------------------------------------
+
+    total_likes = sum(
+        project["likes"]
+        for project in projects
+    )
+
+    total_views = sum(
+        project["views"]
+        for project in projects
+    )
+
+    print()
+    print(
+        f"総いいね数: {total_likes}"
+    )
+
+    print(
+        f"総閲覧数: {total_views}"
+    )
+
+    return {
+        "url": url,
+        "status": "success",
+        "projects": projects,
+        "total_likes": total_likes,
+        "total_views": total_views
+    }
+
+
+# ============================================================
+# DBから全プロフィールURL取得
+# ============================================================
+
+def get_all_programs(
+    conn
+):
+
+    programs = set()
+
+    with conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT program_urls
+            FROM public.users
+            WHERE program_urls IS NOT NULL
+        """)
+
+        rows = cur.fetchall()
+
+    for row in rows:
+
+        urls = row[0] or []
+
+        for url in urls:
+
+            if url:
+
+                programs.add(
+                    url.strip()
+                )
+
+    return sorted(
+        programs
+    )
+
+
+# ============================================================
+# 前回プロジェクトを辞書化
+# ============================================================
+
+def project_map(
+    projects
+):
+
+    result = {}
+
+    for project in projects or []:
+
+        title = clean_text(
+            project.get(
+                "title",
+                ""
+            )
         )
 
-        print(
-            f"いいね: "
-            f"{old_likes} → {new_likes}"
+        if not title:
+            continue
+
+        result[title] = project
+
+    return result
+
+
+# ============================================================
+# いいね増加を検出
+# ============================================================
+
+def detect_like_increases(
+    previous_profile,
+    current_profile
+):
+
+    notifications = []
+
+    previous_projects = project_map(
+        previous_profile.get(
+            "projects",
+            []
+        )
+        if previous_profile
+        else []
+    )
+
+    current_projects = project_map(
+        current_profile.get(
+            "projects",
+            []
+        )
+    )
+
+    for title, current in current_projects.items():
+
+        current_likes = int(
+            current.get(
+                "likes",
+                0
+            )
         )
 
-        if new_likes > old_likes:
+        previous = previous_projects.get(
+            title
+        )
 
-            difference = (
-                new_likes - old_likes
+        # ----------------------------------------------------
+        # 初めて発見したプロジェクト
+        #
+        # 初回は通知しない
+        # ----------------------------------------------------
+
+        if previous is None:
+
+            print(
+                f"新規プロジェクト: "
+                f"{title}"
+            )
+
+            continue
+
+        previous_likes = int(
+            previous.get(
+                "likes",
+                0
+            )
+        )
+
+        # ----------------------------------------------------
+        # 増加
+        # ----------------------------------------------------
+
+        if current_likes > previous_likes:
+
+            increase = (
+                current_likes
+                - previous_likes
             )
 
             print(
-                f"★★★ "
-                f"+{difference} いいね"
-            )
-
-            # ------------------------------------------------
-            # 通知
-            # ------------------------------------------------
-
-            create_notification(
-                conn,
-                user_id,
-                project_url,
-                project_title,
-                old_likes,
-                new_likes
+                "いいね増加:",
+                title,
+                f"{previous_likes} -> "
+                f"{current_likes}",
+                f"(+{increase})"
             )
 
             notifications.append({
-                "project_title": project_title,
-                "program_url": project_url,
-                "old_likes": old_likes,
-                "new_likes": new_likes,
-                "difference": difference,
+                "title": title,
+                "old_likes": previous_likes,
+                "new_likes": current_likes,
+                "increase": increase
             })
 
-        else:
+    return notifications
 
-            print(
-                "いいね増加なし"
+
+# ============================================================
+# 通知登録
+# ============================================================
+
+def create_notifications(
+    conn,
+    user_id,
+    notifications
+):
+
+    created_count = 0
+
+    for notification in notifications:
+
+        title = notification[
+            "title"
+        ]
+
+        new_likes = notification[
+            "new_likes"
+        ]
+
+        message = (
+            f"「{title}」が"
+            f"{new_likes}いいねされました"
+        )
+
+        # ----------------------------------------------------
+        # 直近10分以内の同じ通知を確認
+        # ----------------------------------------------------
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT id
+                FROM public.notifications
+                WHERE user_id = %s
+                  AND type = 'like'
+                  AND message = %s
+                  AND created_at >= NOW()
+                      - INTERVAL '10 minutes'
+                LIMIT 1
+            """, (
+                user_id,
+                message
+            ))
+
+            exists = cur.fetchone()
+
+            if exists:
+
+                print(
+                    "重複通知をスキップ:",
+                    message
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # 通知登録
+            # ------------------------------------------------
+
+            cur.execute("""
+                INSERT INTO public.notifications (
+                    user_id,
+                    actor_id,
+                    type,
+                    post_id,
+                    message_id,
+                    is_read,
+                    message
+                )
+                VALUES (
+                    %s,
+                    NULL,
+                    'like',
+                    NULL,
+                    NULL,
+                    FALSE,
+                    %s
+                )
+            """, (
+                user_id,
+                message
+            ))
+
+        print(
+            "通知作成:",
+            message
+        )
+
+        created_count += 1
+
+    return created_count
+
+
+# ============================================================
+# users更新
+# ============================================================
+
+def update_users(
+    conn,
+    stats
+):
+
+    updated_users = 0
+    notification_count = 0
+
+    with conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT
+                id,
+                program_urls,
+                program_views,
+                program_likes
+            FROM public.users
+            WHERE program_urls IS NOT NULL
+        """)
+
+        rows = cur.fetchall()
+
+        for (
+            user_id,
+            program_urls,
+            old_views,
+            old_likes
+        ) in rows:
+
+            program_urls = (
+                program_urls or []
             )
 
-    # --------------------------------------------------------
-    # DBのprogram_likes更新
-    # --------------------------------------------------------
+            old_views = (
+                old_views or []
+            )
 
-    update_program_likes(
-        conn,
-        user_id,
-        program_urls,
-        current_likes
+            old_likes = (
+                old_likes or []
+            )
+
+            new_views = []
+            new_likes = []
+
+            # ------------------------------------------------
+            # URLごと
+            # ------------------------------------------------
+
+            for index, url in enumerate(
+                program_urls
+            ):
+
+                url = url.strip()
+
+                data = stats.get(
+                    url
+                )
+
+                # ------------------------------------------------
+                # 取得失敗
+                # ------------------------------------------------
+
+                if (
+                    data is None
+                    or data.get("status")
+                    != "success"
+                ):
+
+                    previous_view = (
+                        old_views[index]
+                        if index < len(old_views)
+                        else 0
+                    )
+
+                    previous_like = (
+                        old_likes[index]
+                        if index < len(old_likes)
+                        else 0
+                    )
+
+                    new_views.append(
+                        previous_view
+                    )
+
+                    new_likes.append(
+                        previous_like
+                    )
+
+                    print(
+                        "取得失敗のため"
+                        "既存値を維持:",
+                        url
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # 今回値
+                # ------------------------------------------------
+
+                current_views = data[
+                    "total_views"
+                ]
+
+                current_likes = data[
+                    "total_likes"
+                ]
+
+                new_views.append(
+                    current_views
+                )
+
+                new_likes.append(
+                    current_likes
+                )
+
+            # ------------------------------------------------
+            # users更新
+            # ------------------------------------------------
+
+            cur.execute("""
+                UPDATE public.users
+                SET
+                    program_views = %s,
+                    program_likes = %s
+                WHERE id = %s
+            """, (
+                new_views,
+                new_likes,
+                user_id
+            ))
+
+            updated_users += 1
+
+    conn.commit()
+
+    return (
+        updated_users,
+        notification_count
     )
 
-    # --------------------------------------------------------
-    # 結果
-    # --------------------------------------------------------
 
-    return {
-        "user_id": str(user_id),
-        "username": username,
-        "profile_url": profile_url,
-        "status": "success",
-        "projects": projects,
-        "notifications": notifications,
-    }
+# ============================================================
+# users更新 + 通知
+# ============================================================
+
+def update_users_and_notifications(
+    conn,
+    stats,
+    previous_data
+):
+
+    updated_users = 0
+    notification_count = 0
+
+    previous_profiles = (
+        previous_data.get(
+            "profiles",
+            {}
+        )
+        if previous_data
+        else {}
+    )
+
+    with conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT
+                id,
+                program_urls,
+                program_views,
+                program_likes
+            FROM public.users
+            WHERE program_urls IS NOT NULL
+        """)
+
+        rows = cur.fetchall()
+
+        for (
+            user_id,
+            program_urls,
+            old_views,
+            old_likes
+        ) in rows:
+
+            program_urls = (
+                program_urls or []
+            )
+
+            old_views = (
+                old_views or []
+            )
+
+            old_likes = (
+                old_likes or []
+            )
+
+            new_views = []
+            new_likes = []
+
+            # ------------------------------------------------
+            # URLごと
+            # ------------------------------------------------
+
+            for index, url in enumerate(
+                program_urls
+            ):
+
+                url = url.strip()
+
+                current_profile = stats.get(
+                    url
+                )
+
+                # ------------------------------------------------
+                # 取得失敗
+                # ------------------------------------------------
+
+                if (
+                    current_profile is None
+                    or current_profile.get(
+                        "status"
+                    ) != "success"
+                ):
+
+                    previous_view = (
+                        old_views[index]
+                        if index < len(old_views)
+                        else 0
+                    )
+
+                    previous_like = (
+                        old_likes[index]
+                        if index < len(old_likes)
+                        else 0
+                    )
+
+                    new_views.append(
+                        previous_view
+                    )
+
+                    new_likes.append(
+                        previous_like
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # 今回値
+                # ------------------------------------------------
+
+                current_views = (
+                    current_profile[
+                        "total_views"
+                    ]
+                )
+
+                current_likes = (
+                    current_profile[
+                        "total_likes"
+                    ]
+                )
+
+                new_views.append(
+                    current_views
+                )
+
+                new_likes.append(
+                    current_likes
+                )
+
+                # ------------------------------------------------
+                # GitHubの前回値
+                # ------------------------------------------------
+
+                previous_profile = (
+                    previous_profiles.get(
+                        url
+                    )
+                )
+
+                if previous_profile:
+
+                    increases = (
+                        detect_like_increases(
+                            previous_profile,
+                            current_profile
+                        )
+                    )
+
+                    if increases:
+
+                        count = (
+                            create_notifications(
+                                conn,
+                                user_id,
+                                increases
+                            )
+                        )
+
+                        notification_count += (
+                            count
+                        )
+
+            # ------------------------------------------------
+            # users更新
+            # ------------------------------------------------
+
+            cur.execute("""
+                UPDATE public.users
+                SET
+                    program_views = %s,
+                    program_likes = %s
+                WHERE id = %s
+            """, (
+                new_views,
+                new_likes,
+                user_id
+            ))
+
+            updated_users += 1
+
+    conn.commit()
+
+    return (
+        updated_users,
+        notification_count
+    )
 
 
 # ============================================================
@@ -1246,35 +1163,27 @@ def process_user(
 
 def main():
 
-    fetched_at = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
+    start_time = time.time()
+
+    now = datetime.now(
+        timezone.utc
     )
 
-    print()
+    updated_at = now.isoformat()
+
+    print("=" * 60)
     print(
-        "=" * 70
+        "プログラム統計・いいね通知処理"
     )
+    print("=" * 60)
 
-    print(
-        "ChanPro いいね通知システム"
+    # ========================================================
+    # GitHub前回値
+    # ========================================================
+
+    previous_data, github_sha = (
+        load_previous_stats()
     )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "開始:",
-        fetched_at
-    )
-
-    users_checked = 0
-    projects_checked = 0
-    notifications_created = 0
-
-    result_users = []
 
     # ========================================================
     # DB
@@ -1284,21 +1193,31 @@ def main():
         DATABASE_URL
     ) as conn:
 
-        users = get_all_users(
+        # ----------------------------------------------------
+        # URL取得
+        # ----------------------------------------------------
+
+        programs = get_all_programs(
             conn
         )
 
         print()
         print(
-            "ユーザー数:",
-            len(users)
+            f"プロフィールURL数: "
+            f"{len(programs)}"
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # Playwright
-        # ====================================================
+        # ----------------------------------------------------
+
+        stats = {}
 
         with sync_playwright() as p:
+
+            print(
+                "ブラウザ起動中..."
+            )
 
             browser = p.chromium.launch(
                 headless=True
@@ -1307,7 +1226,7 @@ def main():
             page = browser.new_page(
                 viewport={
                     "width": 1280,
-                    "height": 2000,
+                    "height": 2000
                 },
                 user_agent=(
                     "Mozilla/5.0 "
@@ -1316,102 +1235,124 @@ def main():
                     "(KHTML, like Gecko) "
                     "Chrome/120.0.0.0 "
                     "Safari/537.36"
-                ),
+                )
             )
 
             # ------------------------------------------------
-            # 全ユーザー
+            # 全プロフィール
             # ------------------------------------------------
 
-            for user in users:
+            for url in programs:
 
-                try:
+                result = scrape_profile(
+                    page,
+                    url
+                )
 
-                    result = process_user(
-                        conn,
-                        page,
-                        user
-                    )
-
-                    result_users.append(
-                        result
-                    )
-
-                    users_checked += 1
-
-                    projects_checked += len(
-                        result.get(
-                            "projects",
-                            []
-                        )
-                    )
-
-                    notifications_created += len(
-                        result.get(
-                            "notifications",
-                            []
-                        )
-                    )
-
-                    # ユーザーごとにcommit
-                    # 途中で1人失敗しても、
-                    # それまでの処理を失わない
-                    conn.commit()
-
-                except Exception as e:
-
-                    print()
-                    print(
-                        "ユーザー処理エラー:",
-                        user.get(
-                            "username"
-                        )
-                    )
-
-                    print(
-                        str(e)
-                    )
-
-                    conn.rollback()
-
-                    result_users.append({
-                        "user_id": str(
-                            user["id"]
-                        ),
-                        "username": user[
-                            "username"
-                        ],
-                        "profile_url": None,
-                        "status": "error",
-                        "error": str(e),
-                        "projects": [],
-                        "notifications": [],
-                    })
+                stats[url] = result
 
             browser.close()
 
+        # ====================================================
+        # 通知 + users更新
+        # ====================================================
+
+        (
+            updated_users,
+            notification_count
+        ) = update_users_and_notifications(
+            conn,
+            stats,
+            previous_data
+        )
+
     # ========================================================
-    # JSON
+    # GitHub保存用データ
     # ========================================================
 
-    output = {
-        "fetched_at": fetched_at,
-        "users_checked": users_checked,
-        "projects_checked": projects_checked,
-        "notifications_created": (
-            notifications_created
+    github_data = {
+        "updated_at": updated_at,
+
+        "profile_count": len(
+            stats
         ),
-        "users": result_users,
+
+        "profiles": {}
+    }
+
+    # --------------------------------------------------------
+    # 成功したプロフィールだけ保存
+    # --------------------------------------------------------
+
+    for url, profile in stats.items():
+
+        if profile.get(
+            "status"
+        ) != "success":
+
+            # 失敗した場合は前回値を維持
+            previous_profile = (
+                previous_data
+                .get("profiles", {})
+                .get(url)
+            )
+
+            if previous_profile:
+
+                github_data[
+                    "profiles"
+                ][url] = previous_profile
+
+            continue
+
+        github_data[
+            "profiles"
+        ][url] = {
+            "url": url,
+            "projects": profile[
+                "projects"
+            ],
+            "total_likes": profile[
+                "total_likes"
+            ],
+            "total_views": profile[
+                "total_views"
+            ]
+        }
+
+    # ========================================================
+    # GitHubへ保存
+    # ========================================================
+
+    save_stats_to_github(
+        github_data,
+        github_sha
+    )
+
+    # ========================================================
+    # ローカルにも保存
+    # ========================================================
+
+    local_result = {
+        "updated_at": updated_at,
+        "profile_count": len(
+            stats
+        ),
+        "updated_users": updated_users,
+        "notification_count": (
+            notification_count
+        ),
+        "profiles": stats
     }
 
     with open(
-        RESULT_FILE,
+        OUTPUT_FILE,
         "w",
         encoding="utf-8"
     ) as f:
 
         json.dump(
-            output,
+            local_result,
             f,
             ensure_ascii=False,
             indent=2
@@ -1421,42 +1362,47 @@ def main():
     # 結果
     # ========================================================
 
+    elapsed = (
+        time.time()
+        - start_time
+    )
+
     print()
+    print("=" * 60)
+    print("処理完了")
+    print("=" * 60)
+
     print(
-        "=" * 70
+        f"プロフィール数: "
+        f"{len(programs)}"
     )
 
     print(
-        "処理完了"
+        f"ユーザー更新数: "
+        f"{updated_users}"
     )
 
     print(
-        "=" * 70
+        f"作成した通知数: "
+        f"{notification_count}"
     )
 
     print(
-        "ユーザー確認数:",
-        users_checked
+        f"処理時間: "
+        f"{elapsed:.2f}秒"
     )
 
     print(
-        "プロジェクト確認数:",
-        projects_checked
+        f"GitHub JSON: "
+        f"{GITHUB_FILE_PATH}"
     )
 
     print(
-        "作成通知数:",
-        notifications_created
+        f"ローカル結果: "
+        f"{OUTPUT_FILE}"
     )
 
-    print(
-        "結果:",
-        RESULT_FILE
-    )
-
-    print(
-        "=" * 70
-    )
+    print("=" * 60)
 
 
 # ============================================================
@@ -1464,4 +1410,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
