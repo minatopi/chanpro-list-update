@@ -180,6 +180,10 @@ def extract_numbers(text):
 # ============================================================
 
 def get_icon_number_from_card(card, icon_name):
+    """
+    カード内の #heart / #eyes アイコンを探し、
+    そのアイコンに関連する親Groupから数字を取得する。
+    """
 
     selectors = [
         f'use[href="#{icon_name}"]',
@@ -188,55 +192,50 @@ def get_icon_number_from_card(card, icon_name):
         f'svg use[xlink\\:href="#{icon_name}"]',
     ]
 
-    icon = None
-
     for selector in selectors:
-
         try:
-
             loc = card.locator(selector)
 
-            if loc.count() > 0:
-
-                icon = loc.first
-                break
-
-        except Exception:
-            pass
-
-    if icon is None:
-        return 0
-
-    # --------------------------------------------------------
-    # アイコンの親を順番に辿る
-    # --------------------------------------------------------
-
-    current = icon
-
-    for level in range(1, 10):
-
-        try:
-
-            current = current.locator("xpath=..")
-
-            text = current.inner_text(
-                timeout=1000
-            ).strip()
-
-            if not text:
+            if loc.count() == 0:
                 continue
 
-            numbers = extract_numbers(text)
+            icon = loc.first
 
-            if numbers:
+            # アイコンから親要素を順番に上がる
+            for level in range(1, 12):
 
-                # アイコン周辺の数字を取得
-                return numbers[-1]
+                try:
+                    parent = icon.locator(
+                        "xpath=" + "/.." * level
+                    )
+
+                    text = parent.inner_text(
+                        timeout=1000
+                    ).strip()
+
+                    if not text:
+                        continue
+
+                    # 数字を取得
+                    numbers = re.findall(
+                        r'\d[\d,]*',
+                        text.replace("\n", " ")
+                    )
+
+                    if numbers:
+                        # 最後の数字を採用
+                        value = numbers[-1].replace(",", "")
+
+                        if value.isdigit():
+                            return int(value)
+
+                except Exception:
+                    continue
 
         except Exception:
             continue
 
-    return 0
+    return None
 
 
 # ============================================================
@@ -288,63 +287,102 @@ def get_card_title(card):
 
 def get_card_id(card):
 
-    # --------------------------------------------------------
-    # hrefからIDを取得
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. href
+    # ========================================================
 
     try:
 
         links = card.locator("a")
 
-        count = links.count()
+        for i in range(links.count()):
 
-        for i in range(count):
+            href = links.nth(i).get_attribute(
+                "href"
+            )
 
-            href = links.nth(i).get_attribute("href")
+            if not href:
+                continue
 
-            if href:
+            print(
+                "      href:",
+                href
+            )
 
-                # 数字だけのID
-                match = re.search(
-                    r"/(\d{10,})",
-                    href
-                )
+            # URL中の長い数字
+            m = re.search(
+                r'(\d{15,})',
+                href
+            )
 
-                if match:
-                    return match.group(1)
-
-                # UUID
-                match = re.search(
-                    r"/([0-9a-fA-F-]{20,})",
-                    href
-                )
-
-                if match:
-                    return match.group(1)
+            if m:
+                return m.group(1)
 
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # data-idなど
-    # --------------------------------------------------------
 
-    for attr in [
+    # ========================================================
+    # 2. data属性
+    # ========================================================
+
+    attrs = [
         "data-id",
         "data-log-id",
         "data-record-id",
-        "data-item-id"
-    ]:
+        "data-item-id",
+        "data-program-id"
+    ]
+
+    for attr in attrs:
 
         try:
 
-            value = card.get_attribute(attr)
+            value = card.get_attribute(
+                attr
+            )
 
             if value:
                 return value
 
         except Exception:
             pass
+
+
+    # ========================================================
+    # 3. HTML全体からlog IDを探す
+    # ========================================================
+
+    try:
+
+        html = card.evaluate(
+            "(el) => el.outerHTML"
+        )
+
+        patterns = [
+
+            # log ID
+            r'log[^0-9]{0,30}(\d{15,})',
+
+            # IDっぽい長い数字
+            r'(\d{18,})',
+
+        ]
+
+        for pattern in patterns:
+
+            m = re.search(
+                pattern,
+                html,
+                re.IGNORECASE
+            )
+
+            if m:
+                return m.group(1)
+
+    except Exception:
+        pass
+
 
     return None
 
@@ -357,27 +395,39 @@ def parse_project_card(card):
 
     title = get_card_title(card)
 
+    # #heart
     likes = get_icon_number_from_card(
         card,
         "heart"
     )
 
+    # #eyes
     views = get_icon_number_from_card(
         card,
         "eyes"
     )
 
+    # --------------------------------------------------------
+    # heart / eyes が両方ないものはプロジェクトではない
+    # --------------------------------------------------------
+
+    if likes is None and views is None:
+
+        return None
+
+    if likes is None:
+        likes = 0
+
+    if views is None:
+        views = 0
+
     card_id = get_card_id(card)
 
     print(
-        f"    {title} : "
-        f"いいね={likes} "
-        f"閲覧={views}"
-        + (
-            f" ID={card_id}"
-            if card_id
-            else ""
-        )
+        f"    {title}"
+        f" | いいね={likes}"
+        f" | 閲覧={views}"
+        f" | ID={card_id}"
     )
 
     return {
@@ -406,11 +456,11 @@ def scrape_profile(page, url):
     )
 
     page.wait_for_timeout(
-        WAIT_AFTER_LOAD
+        8000
     )
 
     cards = page.locator(
-        CARD_SELECTOR
+        "div.clickable-element"
     )
 
     card_count = cards.count()
@@ -432,12 +482,11 @@ def scrape_profile(page, url):
                 card
             )
 
-            # 明らかな空カードを除外
-            if (
-                project["title"] == "名称不明"
-                and project["likes"] == 0
-                and project["views"] == 0
-            ):
+            # ------------------------------------------------
+            # プロジェクトでないカードを除外
+            # ------------------------------------------------
+
+            if project is None:
                 continue
 
             projects.append(
@@ -451,13 +500,13 @@ def scrape_profile(page, url):
                 e
             )
 
+    print()
     print(
-        "取得プロジェクト数:",
+        "実際のプロジェクト数:",
         len(projects)
     )
 
     return projects
-
 
 # ============================================================
 # DB接続
