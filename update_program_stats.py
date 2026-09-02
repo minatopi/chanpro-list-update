@@ -14,57 +14,74 @@ from playwright.sync_api import sync_playwright
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# このPythonファイルと同じフォルダ
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# GitHubで管理するJSON
 JSON_FILE = os.path.join(BASE_DIR, "program_stats.json")
 
-# Playwright
 WAIT_AFTER_LOAD = 8000
 
-# 同じ内容の通知を短時間に何度も作らないための時間
-DUPLICATE_MINUTES = 10
+CARD_SELECTOR = "div.clickable-element"
 
 
 # ============================================================
-# 共通
+# 時刻
 # ============================================================
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_git(*args):
-    """
-    gitコマンドを実行
-    """
+# ============================================================
+# Git
+# ============================================================
+
+def run_git(*args, check=True):
+    cmd = ["git"] + list(args)
+
+    print(">", " ".join(cmd))
+
     result = subprocess.run(
-        ["git", *args],
+        cmd,
         cwd=BASE_DIR,
         text=True,
         capture_output=True
     )
 
-    if result.returncode != 0:
-        print("Gitエラー:")
+    if result.stdout:
         print(result.stdout)
+
+    if result.stderr:
         print(result.stderr)
+
+    if check and result.returncode != 0:
         raise RuntimeError(
-            f"git {' '.join(args)} が失敗しました"
+            f"Git command failed: {' '.join(cmd)}"
         )
 
-    return result.stdout.strip()
+    return result
+
+
+def configure_git():
+
+    print("Gitユーザー設定...")
+
+    run_git(
+        "config",
+        "user.name",
+        "github-actions[bot]"
+    )
+
+    run_git(
+        "config",
+        "user.email",
+        "41898282+github-actions[bot]@users.noreply.github.com"
+    )
 
 
 # ============================================================
-# GitHub JSON読み込み
+# JSON
 # ============================================================
 
 def load_previous_stats():
-    """
-    前回の program_stats.json を読み込む
-    """
 
     if not os.path.exists(JSON_FILE):
         print("program_stats.json がありません。新規作成します。")
@@ -75,20 +92,31 @@ def load_previous_stats():
         }
 
     try:
-        with open(JSON_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            JSON_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
 
         if not isinstance(data, dict):
             raise ValueError("JSONの形式が不正です")
 
-        data.setdefault("updated_at", None)
-        data.setdefault("profiles", {})
+        if "profiles" not in data:
+            data["profiles"] = {}
 
         return data
 
     except Exception as e:
-        print("program_stats.json の読み込みに失敗:")
-        print(e)
+
+        print(
+            "program_stats.json の読み込みに失敗:",
+            e
+        )
+
+        print("空のデータとして開始します。")
 
         return {
             "updated_at": None,
@@ -96,16 +124,18 @@ def load_previous_stats():
         }
 
 
-# ============================================================
-# GitHub JSON保存
-# ============================================================
-
 def save_stats(data):
-    """
-    program_stats.jsonを保存
-    """
 
-    with open(JSON_FILE, "w", encoding="utf-8") as f:
+    data["updated_at"] = now_iso()
+
+    temp_file = JSON_FILE + ".tmp"
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
         json.dump(
             data,
             f,
@@ -113,27 +143,210 @@ def save_stats(data):
             indent=2
         )
 
-    print(f"JSON保存完了: {JSON_FILE}")
+        f.write("\n")
+
+    os.replace(
+        temp_file,
+        JSON_FILE
+    )
+
+    print(
+        "program_stats.json を保存しました。"
+    )
 
 
 # ============================================================
 # 数字抽出
 # ============================================================
 
-def extract_number(text):
-    """
-    文字列から最初の整数を取得
-    """
+def extract_numbers(text):
 
     if not text:
-        return None
+        return []
 
-    match = re.search(r"([\d,]+)", text)
+    text = text.replace(",", "")
 
-    if not match:
-        return None
+    return [
+        int(x)
+        for x in re.findall(
+            r"\d+",
+            text
+        )
+    ]
 
-    return int(match.group(1).replace(",", ""))
+
+# ============================================================
+# SVGアイコンから数字取得
+# ============================================================
+
+def get_icon_number_from_card(card, icon_name):
+
+    selectors = [
+        f'use[href="#{icon_name}"]',
+        f'use[xlink\\:href="#{icon_name}"]',
+        f'svg use[href="#{icon_name}"]',
+        f'svg use[xlink\\:href="#{icon_name}"]',
+    ]
+
+    icon = None
+
+    for selector in selectors:
+
+        try:
+
+            loc = card.locator(selector)
+
+            if loc.count() > 0:
+
+                icon = loc.first
+                break
+
+        except Exception:
+            pass
+
+    if icon is None:
+        return 0
+
+    # --------------------------------------------------------
+    # アイコンの親を順番に辿る
+    # --------------------------------------------------------
+
+    current = icon
+
+    for level in range(1, 10):
+
+        try:
+
+            current = current.locator("xpath=..")
+
+            text = current.inner_text(
+                timeout=1000
+            ).strip()
+
+            if not text:
+                continue
+
+            numbers = extract_numbers(text)
+
+            if numbers:
+
+                # アイコン周辺の数字を取得
+                return numbers[-1]
+
+        except Exception:
+            continue
+
+    return 0
+
+
+# ============================================================
+# カードからタイトル取得
+# ============================================================
+
+def get_card_title(card):
+
+    try:
+
+        texts = card.locator(
+            "div.bubble-element.Text"
+        ).all_inner_texts()
+
+        texts = [
+            x.strip()
+            for x in texts
+            if x.strip()
+        ]
+
+        if texts:
+            return texts[0]
+
+    except Exception:
+        pass
+
+    try:
+
+        text = card.inner_text()
+
+        lines = [
+            x.strip()
+            for x in text.splitlines()
+            if x.strip()
+        ]
+
+        if lines:
+            return lines[0]
+
+    except Exception:
+        pass
+
+    return "名称不明"
+
+
+# ============================================================
+# カードから安定したIDを探す
+# ============================================================
+
+def get_card_id(card):
+
+    # --------------------------------------------------------
+    # hrefからIDを取得
+    # --------------------------------------------------------
+
+    try:
+
+        links = card.locator("a")
+
+        count = links.count()
+
+        for i in range(count):
+
+            href = links.nth(i).get_attribute("href")
+
+            if href:
+
+                # 数字だけのID
+                match = re.search(
+                    r"/(\d{10,})",
+                    href
+                )
+
+                if match:
+                    return match.group(1)
+
+                # UUID
+                match = re.search(
+                    r"/([0-9a-fA-F-]{20,})",
+                    href
+                )
+
+                if match:
+                    return match.group(1)
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # data-idなど
+    # --------------------------------------------------------
+
+    for attr in [
+        "data-id",
+        "data-log-id",
+        "data-record-id",
+        "data-item-id"
+    ]:
+
+        try:
+
+            value = card.get_attribute(attr)
+
+            if value:
+                return value
+
+        except Exception:
+            pass
+
+    return None
 
 
 # ============================================================
@@ -141,290 +354,134 @@ def extract_number(text):
 # ============================================================
 
 def parse_project_card(card):
-    """
-    1つのプロジェクトカードから
 
-    title
-    likes
-    views
-    total
+    title = get_card_title(card)
 
-    を取得
-    """
+    likes = get_icon_number_from_card(
+        card,
+        "heart"
+    )
 
-    texts = []
+    views = get_icon_number_from_card(
+        card,
+        "eyes"
+    )
 
-    try:
-        elements = card.locator("div.bubble-element.Text")
+    card_id = get_card_id(card)
 
-        count = elements.count()
-
-        for i in range(count):
-            try:
-                text = elements.nth(i).inner_text().strip()
-
-                if text:
-                    texts.append(text)
-
-            except Exception:
-                pass
-
-    except Exception:
-        pass
-
-    if not texts:
-        return None
-
-    # --------------------------------------------------------
-    # タイトル
-    # --------------------------------------------------------
-
-    title = texts[0].strip()
-
-    if not title:
-        return None
-
-    likes = None
-    views = None
-    total = None
-
-    # --------------------------------------------------------
-    # カード内テキストから数字を探す
-    # --------------------------------------------------------
-
-    for text in texts:
-
-        # 例:
-        # 18こ
-        # 18 こ
-        # 18こいいね
-        m = re.search(r"([\d,]+)\s*こ", text)
-
-        if m:
-            try:
-                likes = int(m.group(1).replace(",", ""))
-            except Exception:
-                pass
-
-        # 例:
-        # 123 / 1000
-        m = re.search(r"([\d,]+)\s*/\s*([\d,]+)", text)
-
-        if m:
-            try:
-                views = int(m.group(1).replace(",", ""))
-                total = int(m.group(2).replace(",", ""))
-            except Exception:
-                pass
-
-    # --------------------------------------------------------
-    # いいねが見つからなかった場合
-    # --------------------------------------------------------
-
-    if likes is None:
-
-        for text in texts[1:]:
-
-            # 「いいね」などの文字が含まれる場合
-            if "いいね" in text:
-
-                n = extract_number(text)
-
-                if n is not None:
-                    likes = n
-                    break
-
-    # --------------------------------------------------------
-    # 視聴数が見つからない場合
-    # --------------------------------------------------------
-
-    if views is None:
-
-        for text in texts[1:]:
-
-            if "再生" in text or "閲覧" in text or "アクセス" in text:
-
-                n = extract_number(text)
-
-                if n is not None:
-                    views = n
-                    break
-
-    # --------------------------------------------------------
-    # 見つからなかった値は0
-    # --------------------------------------------------------
-
-    if likes is None:
-        likes = 0
-
-    if views is None:
-        views = 0
-
-    if total is None:
-        total = 0
+    print(
+        f"    {title} : "
+        f"いいね={likes} "
+        f"閲覧={views}"
+        + (
+            f" ID={card_id}"
+            if card_id
+            else ""
+        )
+    )
 
     return {
+        "id": card_id,
         "title": title,
         "likes": likes,
-        "views": views,
-        "total": total
+        "views": views
     }
 
 
 # ============================================================
-# プロフィールからプロジェクト取得
+# プロフィール解析
 # ============================================================
 
 def scrape_profile(page, url):
-    """
-    プロフィールページから全プロジェクトを取得
-    """
 
     print()
     print("=" * 70)
-    print("プロフィール:")
-    print(url)
+    print("プロフィール:", url)
     print("=" * 70)
 
-    try:
+    page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=60000
+    )
 
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
+    page.wait_for_timeout(
+        WAIT_AFTER_LOAD
+    )
 
-        page.wait_for_timeout(WAIT_AFTER_LOAD)
+    cards = page.locator(
+        CARD_SELECTOR
+    )
 
-    except Exception as e:
+    card_count = cards.count()
 
-        print("ページを開けませんでした:")
-        print(e)
-
-        return None
-
-    # --------------------------------------------------------
-    # プロジェクトカード
-    # --------------------------------------------------------
-
-    cards = page.locator("div.clickable-element")
-
-    try:
-        count = cards.count()
-
-    except Exception:
-        count = 0
-
-    print(f"カード数: {count}")
+    print(
+        "カード数:",
+        card_count
+    )
 
     projects = []
 
-    for i in range(count):
+    for i in range(card_count):
 
         try:
 
             card = cards.nth(i)
 
-            project = parse_project_card(card)
-
-            if not project:
-                continue
-
-            print(
-                f"[{i + 1}] "
-                f"{project['title']} "
-                f"いいね={project['likes']} "
-                f"閲覧={project['views']}"
+            project = parse_project_card(
+                card
             )
 
-            projects.append(project)
+            # 明らかな空カードを除外
+            if (
+                project["title"] == "名称不明"
+                and project["likes"] == 0
+                and project["views"] == 0
+            ):
+                continue
+
+            projects.append(
+                project
+            )
 
         except Exception as e:
 
-            print(f"カード {i + 1} の解析失敗: {e}")
+            print(
+                f"カード {i + 1} の解析失敗:",
+                e
+            )
 
-    # --------------------------------------------------------
-    # 重複タイトル除去
-    # --------------------------------------------------------
-
-    unique_projects = []
-
-    seen = set()
-
-    for project in projects:
-
-        title = project["title"]
-
-        if title in seen:
-            continue
-
-        seen.add(title)
-
-        unique_projects.append(project)
-
-    projects = unique_projects
-
-    # --------------------------------------------------------
-    # 合計
-    # --------------------------------------------------------
-
-    total_likes = sum(
-        project["likes"]
-        for project in projects
+    print(
+        "取得プロジェクト数:",
+        len(projects)
     )
 
-    total_views = sum(
-        project["views"]
-        for project in projects
-    )
-
-    print()
-    print(f"プロジェクト数: {len(projects)}")
-    print(f"いいね合計: {total_likes}")
-    print(f"閲覧合計: {total_views}")
-
-    return {
-        "projects": projects,
-        "total_likes": total_likes,
-        "total_views": total_views
-    }
+    return projects
 
 
 # ============================================================
-# 直近の重複通知チェック
+# DB接続
 # ============================================================
 
-def notification_exists(conn, user_id, message):
-    """
-    同じ通知が直近10分以内に存在するか確認
-    """
-
-    sql = """
-        SELECT id
-        FROM notifications
-        WHERE user_id = %s
-          AND message = %s
-          AND created_at >= NOW() - INTERVAL '10 minutes'
-        LIMIT 1
-    """
+def get_users(conn):
 
     with conn.cursor() as cur:
 
-        cur.execute(
-            sql,
-            (
-                user_id,
-                message
-            )
-        )
+        cur.execute("""
+            SELECT
+                id,
+                username,
+                program_urls
+            FROM public.users
+            WHERE program_urls IS NOT NULL
+              AND array_length(program_urls, 1) > 0
+        """)
 
-        row = cur.fetchone()
-
-    return row is not None
+        return cur.fetchall()
 
 
 # ============================================================
-# 通知作成
+# 通知登録
 # ============================================================
 
 def create_like_notification(
@@ -432,263 +489,196 @@ def create_like_notification(
     user_id,
     title
 ):
-    """
-    いいね増加通知を作成
-    """
 
     message = f"「{title}」がいいねされました"
 
-    # --------------------------------------------------------
-    # 重複防止
-    # --------------------------------------------------------
-
-    if notification_exists(
-        conn,
-        user_id,
-        message
-    ):
-
-        print(
-            f"通知スキップ（重複）: {message}"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 通知INSERT
-    # --------------------------------------------------------
-
-    sql = """
-        INSERT INTO notifications
-        (
-            user_id,
-            actor_id,
-            type,
-            post_id,
-            created_at,
-            message_id,
-            is_read,
-            message
-        )
-        VALUES
-        (
-            %s,
-            NULL,
-            'like',
-            NULL,
-            NOW(),
-            NULL,
-            FALSE,
-            %s
-        )
-    """
-
     with conn.cursor() as cur:
 
-        cur.execute(
-            sql,
-            (
-                user_id,
+        # 同じ通知を短時間に大量生成しない
+        cur.execute("""
+            SELECT id
+            FROM public.notifications
+            WHERE user_id = %s
+              AND type = 'like'
+              AND message = %s
+              AND created_at > NOW() - INTERVAL '10 minutes'
+            LIMIT 1
+        """, (
+            user_id,
+            message
+        ))
+
+        exists = cur.fetchone()
+
+        if exists:
+
+            print(
+                "    通知は既に存在:",
                 message
             )
+
+            return
+
+        cur.execute("""
+            INSERT INTO public.notifications
+            (
+                user_id,
+                type,
+                message,
+                is_read
+            )
+            VALUES
+            (
+                %s,
+                'like',
+                %s,
+                false
+            )
+        """, (
+            user_id,
+            message
+        ))
+
+        print(
+            "    ★ いいね通知:",
+            message
         )
 
-    print(
-        f"通知作成: user={user_id} "
-        f"message={message}"
-    )
-
-    return True
-
 
 # ============================================================
-# 前回値との比較
+# いいね増加チェック
 # ============================================================
 
-def compare_and_notify(
+def check_like_increase(
     conn,
-    previous_profile,
-    current_profile,
-    user_id
+    user_id,
+    previous_projects,
+    current_projects
 ):
-    """
-    プロジェクトごとのいいね数を比較
-    """
 
-    previous_projects = {}
+    # --------------------------------------------------------
+    # ID優先
+    # IDがない場合はタイトルをキーにする
+    # --------------------------------------------------------
 
-    if previous_profile:
+    previous_map = {}
 
-        for project in previous_profile.get(
-            "projects",
-            []
-        ):
+    for project in previous_projects:
 
-            title = project.get("title")
+        project_id = project.get("id")
 
-            if title:
-                previous_projects[title] = project
+        if project_id:
 
-    current_projects = current_profile.get(
-        "projects",
-        []
-    )
+            key = f"id:{project_id}"
 
-    notification_count = 0
+        else:
+
+            key = f"title:{project.get('title', '')}"
+
+        previous_map[key] = project
 
     for current in current_projects:
 
-        title = current["title"]
+        project_id = current.get("id")
 
-        current_likes = int(
-            current.get("likes", 0)
-        )
+        if project_id:
 
-        previous = previous_projects.get(title)
+            key = f"id:{project_id}"
 
-        # ----------------------------------------------------
-        # 初回登場プロジェクト
-        # ----------------------------------------------------
+        else:
+
+            key = f"title:{current.get('title', '')}"
+
+        previous = previous_map.get(key)
 
         if previous is None:
 
             print(
-                f"新規プロジェクト: {title} "
-                f"（通知なし）"
+                f"    新規プロジェクト: "
+                f"{current['title']}"
             )
 
+            # 初回登録時は通知しない
             continue
 
-        previous_likes = int(
+        old_likes = int(
             previous.get("likes", 0)
         )
 
-        # ----------------------------------------------------
-        # いいね増加
-        # ----------------------------------------------------
+        new_likes = int(
+            current.get("likes", 0)
+        )
 
-        if current_likes > previous_likes:
+        if new_likes > old_likes:
 
-            difference = (
-                current_likes -
-                previous_likes
-            )
+            diff = new_likes - old_likes
 
             print(
-                f"いいね増加: {title} "
-                f"{previous_likes} → "
-                f"{current_likes} "
-                f"(+{difference})"
+                f"    ★ いいね増加 "
+                f"{current['title']} "
+                f"{old_likes} → {new_likes} "
+                f"(+{diff})"
             )
 
-            created = create_like_notification(
+            create_like_notification(
                 conn,
                 user_id,
-                title
+                current["title"]
             )
 
-            if created:
-                notification_count += 1
-
-        # ----------------------------------------------------
-        # 変化なし
-        # ----------------------------------------------------
-
-        elif current_likes == previous_likes:
-
-            print(
-                f"変化なし: {title} "
-                f"{current_likes}"
-            )
-
-        # ----------------------------------------------------
-        # いいね減少
-        # ----------------------------------------------------
-
-        else:
-
-            print(
-                f"いいね減少: {title} "
-                f"{previous_likes} → "
-                f"{current_likes}"
-            )
-
-    return notification_count
-
 
 # ============================================================
-# users.program_urls取得
+# ユーザーDB更新
 # ============================================================
 
-def get_users(conn):
-    """
-    usersテーブルから
-    id / username / program_urls
-    を取得
-    """
-
-    sql = """
-        SELECT
-            id,
-            username,
-            program_urls
-        FROM users
-        WHERE program_urls IS NOT NULL
-    """
-
-    with conn.cursor() as cur:
-
-        cur.execute(sql)
-
-        rows = cur.fetchall()
-
-    return rows
-
-
-# ============================================================
-# users.program_views / program_likes 更新
-# ============================================================
-
-def update_user_program_stats(
+def update_user_stats(
     conn,
     user_id,
-    projects
+    profile_stats
 ):
-    """
-    users.program_views
-    users.program_likes
 
-    を更新
-    """
+    # --------------------------------------------------------
+    # プロフィール全体の合計
+    # --------------------------------------------------------
 
-    views = [
-        int(project.get("views", 0))
-        for project in projects
-    ]
+    total_likes = sum(
+        int(x.get("likes", 0))
+        for x in profile_stats
+    )
 
-    likes = [
-        int(project.get("likes", 0))
-        for project in projects
-    ]
+    total_views = sum(
+        int(x.get("views", 0))
+        for x in profile_stats
+    )
 
-    sql = """
-        UPDATE users
-        SET
-            program_views = %s,
-            program_likes = %s
-        WHERE id = %s
-    """
+    print(
+        "    合計:",
+        "いいね=", total_likes,
+        "閲覧=", total_views
+    )
+
+    # --------------------------------------------------------
+    # 既存の配列形式を壊さないため、
+    # プロフィール単位の値を1要素配列として保存
+    #
+    # ※ program_views / program_likes を
+    # URLごとの値として使っている場合は、
+    # この部分だけ元仕様に合わせて変更してください。
+    # --------------------------------------------------------
 
     with conn.cursor() as cur:
 
-        cur.execute(
-            sql,
-            (
-                views,
-                likes,
-                user_id
-            )
-        )
+        cur.execute("""
+            UPDATE public.users
+            SET
+                program_views = %s,
+                program_likes = %s
+            WHERE id = %s
+        """, (
+            [total_views],
+            [total_likes],
+            user_id
+        ))
 
 
 # ============================================================
@@ -699,26 +689,26 @@ def main():
 
     print()
     print("=" * 70)
-    print("Chanpro プロジェクト統計・いいね通知システム")
+    print("Chanpro プロジェクト統計更新")
     print("=" * 70)
     print()
 
     # --------------------------------------------------------
-    # 前回JSON
+    # 前回データ
     # --------------------------------------------------------
 
     previous_data = load_previous_stats()
 
-    print(
-        f"前回更新: "
-        f"{previous_data.get('updated_at')}"
+    previous_profiles = previous_data.get(
+        "profiles",
+        {}
     )
 
     # --------------------------------------------------------
-    # DB接続
+    # DB
     # --------------------------------------------------------
 
-    print("PostgreSQLへ接続しています...")
+    print("PostgreSQLへ接続...")
 
     conn = psycopg.connect(
         DATABASE_URL
@@ -726,298 +716,216 @@ def main():
 
     print("DB接続成功")
 
-    # --------------------------------------------------------
-    # users取得
-    # --------------------------------------------------------
+    try:
 
-    users = get_users(conn)
+        users = get_users(conn)
 
-    print(
-        f"対象ユーザー数: {len(users)}"
-    )
-
-    # --------------------------------------------------------
-    # URL重複除去
-    # --------------------------------------------------------
-
-    url_to_users = {}
-
-    for user_id, username, program_urls in users:
-
-        if not program_urls:
-            continue
-
-        for url in program_urls:
-
-            if not url:
-                continue
-
-            url = url.strip()
-
-            if not url:
-                continue
-
-            url_to_users.setdefault(
-                url,
-                []
-            ).append(
-                (
-                    user_id,
-                    username
-                )
-            )
-
-    print(
-        f"対象プロフィールURL数: "
-        f"{len(url_to_users)}"
-    )
-
-    # --------------------------------------------------------
-    # Playwright
-    # --------------------------------------------------------
-
-    new_profiles = {}
-
-    total_notifications = 0
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-        page = browser.new_page(
-            viewport={
-                "width": 1440,
-                "height": 1000
-            }
+        print(
+            "対象ユーザー:",
+            len(users)
         )
 
         # ----------------------------------------------------
-        # URLごとに処理
+        # Playwright
         # ----------------------------------------------------
 
-        for url, owners in url_to_users.items():
+        with sync_playwright() as p:
 
-            print()
-            print("#" * 70)
-            print(f"処理中: {url}")
-            print("#" * 70)
+            browser = p.chromium.launch(
+                headless=True
+            )
 
-            current_profile = scrape_profile(
-                page,
-                url
+            page = browser.new_page(
+                viewport={
+                    "width": 1440,
+                    "height": 1000
+                }
             )
 
             # ------------------------------------------------
-            # スクレイピング失敗
+            # URLごとに一度だけスクレイピング
             # ------------------------------------------------
 
-            if current_profile is None:
+            profile_cache = {}
 
-                print(
-                    "取得失敗。前回データを保持します。"
-                )
-
-                if url in previous_data["profiles"]:
-
-                    new_profiles[url] = (
-                        previous_data["profiles"][url]
-                    )
-
-                continue
-
-            # ------------------------------------------------
-            # 前回プロフィール
-            # ------------------------------------------------
-
-            previous_profile = (
-                previous_data["profiles"].get(url)
-            )
-
-            # ------------------------------------------------
-            # このプロフィールを所有するユーザー
-            # ------------------------------------------------
-
-            for user_id, username in owners:
+            for user_id, username, program_urls in users:
 
                 print()
                 print(
-                    f"ユーザー: {username}"
-                )
-
-                # --------------------------------------------
-                # いいね比較
-                # --------------------------------------------
-
-                notifications = compare_and_notify(
-                    conn,
-                    previous_profile,
-                    current_profile,
+                    "ユーザー:",
+                    username,
                     user_id
                 )
 
-                total_notifications += notifications
+                if not program_urls:
+                    continue
 
-                # --------------------------------------------
-                # usersテーブル更新
-                # --------------------------------------------
+                for url in program_urls:
 
-                update_user_program_stats(
-                    conn,
-                    user_id,
-                    current_profile["projects"]
-                )
+                    if not url:
+                        continue
 
-            # ------------------------------------------------
-            # JSON用データ
-            # ------------------------------------------------
+                    if url not in profile_cache:
 
-            new_profiles[url] = current_profile
+                        try:
 
-        browser.close()
+                            projects = scrape_profile(
+                                page,
+                                url
+                            )
+
+                            profile_cache[url] = projects
+
+                        except Exception as e:
+
+                            print(
+                                "プロフィール取得失敗:",
+                                url,
+                                e
+                            )
+
+                            profile_cache[url] = []
+
+                    projects = profile_cache[url]
+
+                    # ----------------------------------------
+                    # 前回値
+                    # ----------------------------------------
+
+                    old_profile = (
+                        previous_profiles
+                        .get(url, {})
+                    )
+
+                    old_projects = (
+                        old_profile
+                        .get("projects", [])
+                    )
+
+                    # ----------------------------------------
+                    # いいね増加確認
+                    # ----------------------------------------
+
+                    check_like_increase(
+                        conn,
+                        user_id,
+                        old_projects,
+                        projects
+                    )
+
+            browser.close()
+
+        # ----------------------------------------------------
+        # JSONを作り直す
+        # ----------------------------------------------------
+
+        new_profiles = {}
+
+        for url, projects in profile_cache.items():
+
+            new_profiles[url] = {
+                "updated_at": now_iso(),
+                "projects": projects
+            }
+
+        new_data = {
+            "updated_at": now_iso(),
+            "profiles": new_profiles
+        }
+
+        save_stats(
+            new_data
+        )
+
+        # ----------------------------------------------------
+        # DBコミット
+        # ----------------------------------------------------
+
+        conn.commit()
+
+        print()
+        print("DB更新をコミットしました。")
+
+    except Exception:
+
+        conn.rollback()
+
+        raise
+
+    finally:
+
+        conn.close()
 
     # ========================================================
-    # DBコミット
+    # GitHub
     # ========================================================
-
-    conn.commit()
 
     print()
     print("=" * 70)
-    print("DB更新完了")
-    print(
-        f"今回作成した通知: "
-        f"{total_notifications}"
-    )
+    print("GitHubへ保存")
     print("=" * 70)
 
-    conn.close()
-
-    # ========================================================
-    # 新しいJSON
-    # ========================================================
-
-    new_data = {
-        "updated_at": now_iso(),
-        "profiles": new_profiles
-    }
-
-    save_stats(new_data)
-
-    # ========================================================
-    # Git差分確認
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("GitHub更新")
-    print("=" * 70)
+    configure_git()
 
     status = run_git(
         "status",
-        "--short"
+        "--porcelain"
     )
 
-    if not status:
+    if not status.stdout.strip():
 
         print(
-            "変更がありません。"
+            "変更がないためGit commitは不要です。"
         )
 
         return
 
-    print()
-    print("変更内容:")
-    print(status)
+    print(
+        "変更ファイル:"
+    )
 
-    # --------------------------------------------------------
-    # git add
-    # --------------------------------------------------------
+    print(
+        status.stdout
+    )
 
     run_git(
         "add",
         "program_stats.json"
     )
 
-    # --------------------------------------------------------
-    # git commit
-    # --------------------------------------------------------
-
-    commit_message = (
-        "Update Chanpro program stats"
-    )
-
-    commit_result = subprocess.run(
-        [
-            "git",
-            "commit",
-            "-m",
-            commit_message
-        ],
-        cwd=BASE_DIR,
-        text=True,
-        capture_output=True
+    commit_result = run_git(
+        "commit",
+        "-m",
+        "Update program stats",
+        check=False
     )
 
     if commit_result.returncode != 0:
 
-        print("git commit失敗")
-
-        print(
+        # commit対象がない場合
+        if "nothing to commit" in (
             commit_result.stdout
-        )
+            + commit_result.stderr
+        ).lower():
 
-        print(
-            commit_result.stderr
-        )
+            print(
+                "commit対象がありません。"
+            )
+
+            return
 
         raise RuntimeError(
             "git commitに失敗しました"
         )
 
-    print(
-        commit_result.stdout
+    run_git(
+        "push"
     )
-
-    # --------------------------------------------------------
-    # git push
-    # --------------------------------------------------------
-
-    print("GitHubへpushしています...")
-
-    push_result = subprocess.run(
-        [
-            "git",
-            "push"
-        ],
-        cwd=BASE_DIR,
-        text=True,
-        capture_output=True
-    )
-
-    print(
-        push_result.stdout
-    )
-
-    if push_result.returncode != 0:
-
-        print(
-            "git push失敗:"
-        )
-
-        print(
-            push_result.stderr
-        )
-
-        raise RuntimeError(
-            "git pushに失敗しました"
-        )
 
     print()
-    print("=" * 70)
-    print("GitHub更新完了")
-    print("=" * 70)
+    print(
+        "GitHubへのpush完了"
+    )
 
 
 # ============================================================
@@ -1026,21 +934,4 @@ def main():
 
 if __name__ == "__main__":
 
-    try:
-
-        main()
-
-    except KeyboardInterrupt:
-
-        print()
-        print("中断されました。")
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("ERROR")
-        print("=" * 70)
-        print(e)
-
-        raise
+    main()
