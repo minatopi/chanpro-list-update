@@ -2,10 +2,12 @@ name: Update Program Stats
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/10 * * * *"
 
-  # GitHub画面から手動実行も可能
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   update:
@@ -14,22 +16,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install psycopg[binary] playwright
+          playwright install chromium
+          playwright install-deps chromium
 
-      - name: Install Playwright Chromium
-        run: |
-          playwright install --with-deps chromium
-
-      - name: Update program stats
+      - name: Run scraper
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
