@@ -13,8 +13,6 @@ from playwright.sync_api import sync_playwright
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# GitHub Actionsで実行する場合、
-# リポジトリ内にこのJSONを置く
 STATE_FILE = "program_likes.json"
 
 
@@ -23,12 +21,11 @@ STATE_FILE = "program_likes.json"
 # ============================================================
 
 def load_state():
-    """
-    GitHubに保存している前回のいいね数を読み込む
-    """
 
     if not os.path.exists(STATE_FILE):
-        print("前回のJSONがありません。初回実行として扱います。")
+
+        print("program_likes.json がありません")
+        print("初回実行として開始します")
 
         return {
             "updated_at": None,
@@ -36,22 +33,21 @@ def load_state():
         }
 
     try:
+
         with open(
             STATE_FILE,
             "r",
             encoding="utf-8"
         ) as f:
 
-            data = json.load(f)
-
-        if "users" not in data:
-            data["users"] = {}
-
-        return data
+            return json.load(f)
 
     except Exception as e:
 
-        print("JSON読み込み失敗:", e)
+        print(
+            "JSON読み込みエラー:",
+            e
+        )
 
         return {
             "updated_at": None,
@@ -63,11 +59,12 @@ def load_state():
 # JSON保存
 # ============================================================
 
-def save_state(state):
+def save_state(data):
 
-    state["updated_at"] = datetime.now(
-        timezone.utc
-    ).isoformat()
+    data["updated_at"] = (
+        datetime.now(timezone.utc)
+        .isoformat()
+    )
 
     with open(
         STATE_FILE,
@@ -76,7 +73,7 @@ def save_state(state):
     ) as f:
 
         json.dump(
-            state,
+            data,
             f,
             ensure_ascii=False,
             indent=2
@@ -84,213 +81,188 @@ def save_state(state):
 
 
 # ============================================================
-# アイコンから数字取得
+# カード解析
 # ============================================================
 
-def get_number_from_icon(page, icon_name):
-    """
-    #eyes / #heart のアイコンから数字を取得
-    """
+def parse_card(text):
 
-    try:
+    lines = [
+        l.strip()
+        for l in text.split("\n")
+        if l.strip()
+    ]
 
-        icon = page.locator(
-            f'use[href*="#{icon_name}"]'
-        )
+    # 不要な文字を除外
+    lines = [
+        l
+        for l in lines
+        if l not in ["ログイン"]
+        and not l.startswith("Lv.")
+    ]
 
-        if icon.count() == 0:
-            return None
-
-        group = icon.first.locator(
-            "xpath=ancestor::div[contains(@class, 'Group')][1]"
-        )
-
-        if group.count() == 0:
-            return None
-
-        text = group.inner_text()
-
-        numbers = re.findall(
-            r"\d[\d,]*",
-            text
-        )
-
-        if not numbers:
-            return None
-
-        return int(
-            numbers[-1].replace(",", "")
-        )
-
-    except Exception as e:
-
-        print(
-            f"数字取得エラー [{icon_name}]:",
-            e
-        )
-
+    if not lines:
         return None
 
-
-# ============================================================
-# タイトル取得
-# ============================================================
-
-def get_program_title(page):
-    """
-    作品ページから作品タイトルを取得する。
-
-    h1を優先。
-    見つからない場合はページ内の文字から候補を探す。
-    """
-
     # --------------------------------------------------------
-    # h1
+    # 最初の文字列を作品タイトル
     # --------------------------------------------------------
 
-    try:
-
-        h1 = page.locator("h1").first
-
-        if h1.count() > 0:
-
-            text = h1.inner_text(
-                timeout=3000
-            ).strip()
-
-            if text:
-                return text
-
-    except Exception:
-        pass
+    title = lines[0]
 
     # --------------------------------------------------------
-    # titleタグ
+    # 数字取得
     # --------------------------------------------------------
 
-    try:
+    nums = re.findall(
+        r"\d[\d,]*",
+        text
+    )
 
-        title = page.title().strip()
+    likes = 0
+    views = 0
 
-        if title:
+    if len(nums) >= 1:
 
-            # サイト名などを除去
-            title = re.sub(
-                r"\s*[\|\-｜－]\s*.*$",
-                "",
-                title
-            ).strip()
+        likes = int(
+            nums[0].replace(",", "")
+        )
 
-            if title:
-                return title
+    if len(nums) >= 2:
 
-    except Exception:
-        pass
+        views = int(
+            nums[1].replace(",", "")
+        )
 
-    return None
+    return {
+        "title": title,
+        "likes": likes,
+        "views": views
+    }
 
 
 # ============================================================
-# 作品情報取得
+# プロフィールページから作品取得
 # ============================================================
 
-def get_program_data(page, url):
+def scrape_profile(page, profile_url):
 
     print()
-    print("取得中:")
-    print(url)
+    print("=" * 60)
+    print("プロフィール取得")
+    print(profile_url)
+    print("=" * 60)
 
     try:
 
         page.goto(
-            url,
+            profile_url,
             wait_until="domcontentloaded",
             timeout=60000
         )
 
-        # Bubbleの描画を待つ
-        page.wait_for_timeout(5000)
+        # Bubbleの描画待ち
+        page.wait_for_timeout(8000)
 
-        likes = get_number_from_icon(
-            page,
-            "heart"
+        # ----------------------------------------------------
+        # 作品カードの入っているコンテナ
+        # ----------------------------------------------------
+
+        container = page.locator(
+            "div.bubble-element.Group.baTcwaH1"
+        ).first
+
+        container.wait_for(
+            timeout=30000
         )
 
-        views = get_number_from_icon(
-            page,
-            "eyes"
-        )
-
-        title = get_program_title(page)
-
-        # タイトルが取れなかった場合
-        if not title:
-            title = "作品"
-
-        result = {
-            "url": url,
-            "title": title,
-            "likes": likes,
-            "views": views,
-            "status": "success"
-        }
+        cards = container.locator(
+            "div.clickable-element"
+        ).all()
 
         print(
-            f"  タイトル: {title}"
+            "cards:",
+            len(cards)
         )
 
-        print(
-            f"  いいね: {likes}"
-        )
+        results = []
 
-        print(
-            f"  閲覧数: {views}"
-        )
+        for i, card in enumerate(cards):
 
-        return result
+            try:
+
+                text = card.inner_text()
+
+                print()
+                print(
+                    f"--- CARD {i + 1} ---"
+                )
+
+                print(text)
+
+                parsed = parse_card(
+                    text
+                )
+
+                if parsed:
+
+                    print(
+                        f"タイトル: {parsed['title']}"
+                    )
+
+                    print(
+                        f"いいね: {parsed['likes']}"
+                    )
+
+                    print(
+                        f"閲覧数: {parsed['views']}"
+                    )
+
+                    results.append(
+                        parsed
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"CARD {i + 1} error:",
+                    e
+                )
+
+        return results
 
     except Exception as e:
 
         print(
-            "取得失敗:",
-            url
+            "プロフィール取得失敗:",
+            profile_url
         )
 
         print(
             str(e)
         )
 
-        return {
-            "url": url,
-            "title": None,
-            "likes": None,
-            "views": None,
-            "status": "error",
-            "error": str(e)
-        }
+        return []
 
 
 # ============================================================
-# 全ユーザーの作品を取得
+# DBからユーザーとプロフィールURLを取得
 # ============================================================
 
-def get_all_user_programs(conn):
+def get_users(conn):
 
     """
-    ユーザーごとに全作品を取得する。
+    usersテーブルから
 
-    戻り値:
+        id
+        program_urls
 
-    {
-        user_id: [
-            url,
-            url,
-            ...
-        ]
-    }
+    を取得。
+
+    program_urlsからプロフィールURLを作る。
+
+    ※プロフィールURLが別カラムにある場合は
+      ここを変更する。
     """
-
-    result = {}
 
     with conn.cursor() as cur:
 
@@ -304,73 +276,49 @@ def get_all_user_programs(conn):
 
         rows = cur.fetchall()
 
-    for user_id, program_urls in rows:
-
-        program_urls = program_urls or []
-
-        urls = []
-
-        for url in program_urls:
-
-            if not url:
-                continue
-
-            url = url.strip()
-
-            if url:
-                urls.append(url)
-
-        if urls:
-            result[str(user_id)] = urls
-
-    return result
+    return rows
 
 
 # ============================================================
-# URL → 実際に所有しているユーザー
+# program_urlsからプロフィールURLを取得
 # ============================================================
 
-def get_user_program_map(user_programs):
+def get_profile_url(program_urls):
 
     """
-    同じ作品URLを複数ユーザーが持っていても対応できるようにする。
+    現在のprogram_urlsが作品URLの配列の場合、
+    ここでプロフィールURLを決める。
 
-    {
-        url: [
-            user_id,
-            user_id
-        ]
-    }
     """
 
-    result = {}
+    if not program_urls:
+        return None
 
-    for user_id, urls in user_programs.items():
+    # --------------------------------------------------------
+    # ここは実際のサイト構造に合わせる必要があります。
+    #
+    # もし program_urls 自体がプロフィールURLではなく
+    # 「作品URL」の配列なら、
+    # DBにプロフィールURLを保存しているカラムが
+    # 別にある場合はそちらを使うのが確実です。
+    # --------------------------------------------------------
 
-        for url in urls:
-
-            if url not in result:
-                result[url] = []
-
-            result[url].append(
-                user_id
-            )
-
-    return result
+    return None
 
 
 # ============================================================
-# いいね通知
+# 通知作成
 # ============================================================
 
-def create_like_notification(
+def create_notification(
     conn,
     user_id,
-    title,
-    increase
+    title
 ):
 
-    message = f"「{title}」にいいねがされました"
+    message = (
+        f"「{title}」にいいねがされました"
+    )
 
     try:
 
@@ -402,19 +350,15 @@ def create_like_notification(
 
         print()
         print(
-            "★ 通知作成"
+            "★ 通知作成成功"
         )
 
         print(
-            f"  ユーザーID: {user_id}"
+            f"  user_id: {user_id}"
         )
 
         print(
-            f"  通知: {message}"
-        )
-
-        print(
-            f"  増加数: +{increase}"
+            f"  message: {message}"
         )
 
         return True
@@ -423,19 +367,19 @@ def create_like_notification(
 
         print()
         print(
-            "★★ 通知INSERT失敗 ★★"
+            "★★ 通知作成失敗 ★★"
         )
 
         print(
-            f"  ユーザーID: {user_id}"
+            f"  user_id: {user_id}"
         )
 
         print(
-            f"  メッセージ: {message}"
+            f"  message: {message}"
         )
 
         print(
-            f"  エラー: {e}"
+            f"  error: {e}"
         )
 
         return False
@@ -447,91 +391,52 @@ def create_like_notification(
 
 def main():
 
-    fetched_at = datetime.now(
-        timezone.utc
-    ).isoformat()
-
     print("=" * 70)
-    print("作品いいね数チェック開始")
+    print("作品別いいね数チェック")
     print("=" * 70)
 
     # --------------------------------------------------------
-    # 前回データ
+    # 前回JSON
     # --------------------------------------------------------
 
-    state = load_state()
+    old_state = load_state()
 
-    old_users = state.get(
+    old_users = old_state.get(
         "users",
         {}
     )
 
-    print()
-    print(
-        f"前回JSONのユーザー数: {len(old_users)}"
-    )
+    # --------------------------------------------------------
+    # 新しいJSON
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # DB接続
-    # --------------------------------------------------------
+    new_state = {
+        "updated_at": None,
+        "users": {}
+    }
+
+    notification_count = 0
+
+    # ========================================================
+    # DB
+    # ========================================================
 
     with psycopg.connect(
         DATABASE_URL
     ) as conn:
 
-        # ----------------------------------------------------
-        # ユーザーごとの作品一覧
-        # ----------------------------------------------------
-
-        user_programs = get_all_user_programs(
+        users = get_users(
             conn
         )
 
         print()
         print(
-            f"ユーザー数: {len(user_programs)}"
-        )
-
-        total_urls = sum(
-            len(urls)
-            for urls in user_programs.values()
-        )
-
-        print(
-            f"作品登録数: {total_urls}"
-        )
-
-        # ----------------------------------------------------
-        # URLを重複排除
-        # ----------------------------------------------------
-
-        all_urls = set()
-
-        for urls in user_programs.values():
-
-            for url in urls:
-
-                all_urls.add(url)
-
-        all_urls = sorted(all_urls)
-
-        print(
-            f"実際に取得するURL数: {len(all_urls)}"
-        )
-
-        # ----------------------------------------------------
-        # URL → ユーザー
-        # ----------------------------------------------------
-
-        url_users = get_user_program_map(
-            user_programs
+            f"ユーザー数: {len(users)}"
         )
 
         # ====================================================
         # Playwright
         # ====================================================
-
-        current_data = {}
 
         with sync_playwright() as p:
 
@@ -551,223 +456,222 @@ def main():
                 )
             )
 
-            for url in all_urls:
+            # =================================================
+            # ユーザーごと
+            # =================================================
 
-                result = get_program_data(
-                    page,
-                    url
+            for user_id, program_urls in users:
+
+                user_id = str(
+                    user_id
                 )
 
-                current_data[url] = result
-
-            browser.close()
-
-        # ====================================================
-        # いいね数比較
-        # ====================================================
-
-        notification_count = 0
-
-        print()
-        print("=" * 70)
-        print("いいね数比較")
-        print("=" * 70)
-
-        for url in all_urls:
-
-            current = current_data.get(url)
-
-            if not current:
-                continue
-
-            if current["status"] != "success":
-                continue
-
-            new_likes = current["likes"]
-
-            if new_likes is None:
-                continue
-
-            title = current.get(
-                "title"
-            )
-
-            if not title:
-                title = "作品"
-
-            # ------------------------------------------------
-            # この作品を持っているユーザー
-            # ------------------------------------------------
-
-            users = url_users.get(
-                url,
-                []
-            )
-
-            for user_id in users:
-
-                user_old_data = old_users.get(
-                    user_id,
-                    {}
+                print()
+                print("#" * 70)
+                print(
+                    "USER:",
+                    user_id
                 )
-
-                old_programs = user_old_data.get(
-                    "programs",
-                    {}
-                )
-
-                old_program = old_programs.get(
-                    url
-                )
+                print("#" * 70)
 
                 # ------------------------------------------------
-                # 初回
+                # プロフィールURL
+                # ------------------------------------------------
+                #
+                # ここが重要
+                #
+                # 実際に「そのユーザーのプロフィールURL」が
+                # DBのどこに入っているかによって変更します。
+                #
+                # 例:
+                #
+                # profile_url = user_profile_url
+                #
                 # ------------------------------------------------
 
-                if old_program is None:
+                profile_url = get_profile_url(
+                    program_urls
+                )
 
-                    print()
-                    print(
-                        "初回登録:"
-                    )
-
-                    print(
-                        f"  ユーザー: {user_id}"
-                    )
+                if not profile_url:
 
                     print(
-                        f"  作品: {title}"
-                    )
-
-                    print(
-                        f"  いいね: {new_likes}"
+                        "プロフィールURLを取得できません"
                     )
 
                     continue
 
-                old_likes = old_program.get(
-                    "likes",
-                    0
+                # ------------------------------------------------
+                # プロフィールから全作品取得
+                # ------------------------------------------------
+
+                posts = scrape_profile(
+                    page,
+                    profile_url
                 )
 
-                if old_likes is None:
-                    old_likes = 0
-
                 # ------------------------------------------------
-                # 増加
+                # 新しいJSONへ保存
                 # ------------------------------------------------
 
-                if new_likes > old_likes:
+                new_state["users"][
+                    user_id
+                ] = {
+                    "profile_url": profile_url,
+                    "programs": {}
+                }
 
-                    increase = (
-                        new_likes
-                        - old_likes
-                    )
+                # ------------------------------------------------
+                # 前回ユーザーデータ
+                # ------------------------------------------------
 
-                    print()
-                    print(
-                        "★ いいね増加検出"
-                    )
+                old_user = old_users.get(
+                    user_id,
+                    {}
+                )
 
-                    print(
-                        f"  ユーザーID: {user_id}"
-                    )
+                old_programs = old_user.get(
+                    "programs",
+                    {}
+                )
 
-                    print(
-                        f"  作品: {title}"
-                    )
+                # ------------------------------------------------
+                # 作品ごと
+                # ------------------------------------------------
 
-                    print(
-                        f"  前回: {old_likes}"
-                    )
+                for post in posts:
 
-                    print(
-                        f"  今回: {new_likes}"
-                    )
+                    title = post["title"]
 
-                    print(
-                        f"  増加: +{increase}"
+                    likes = post["likes"]
+
+                    # 作品をタイトルで保存
+                    #
+                    # 同名作品がある場合はURL方式に
+                    # 変更した方が安全。
+                    #
+
+                    key = title
+
+                    # ------------------------------------------------
+                    # 新JSON
+                    # ------------------------------------------------
+
+                    new_state["users"][
+                        user_id
+                    ]["programs"][
+                        key
+                    ] = {
+                        "title": title,
+                        "likes": likes,
+                        "views": post["views"]
+                    }
+
+                    # ------------------------------------------------
+                    # 前回値
+                    # ------------------------------------------------
+
+                    old_post = old_programs.get(
+                        key
                     )
 
                     # ------------------------------------------------
-                    # 通知
+                    # 初回
                     # ------------------------------------------------
 
-                    created = create_like_notification(
-                        conn=conn,
-                        user_id=user_id,
-                        title=title,
-                        increase=increase
+                    if old_post is None:
+
+                        print()
+                        print(
+                            "初回登録:"
+                        )
+
+                        print(
+                            f"  作品: {title}"
+                        )
+
+                        print(
+                            f"  いいね: {likes}"
+                        )
+
+                        continue
+
+                    old_likes = old_post.get(
+                        "likes",
+                        0
                     )
 
-                    if created:
+                    # ------------------------------------------------
+                    # 増加
+                    # ------------------------------------------------
 
-                        notification_count += 1
+                    if likes > old_likes:
 
-        # --------------------------------------------------------
-        # 通知INSERTを確定
-        # --------------------------------------------------------
+                        increase = (
+                            likes
+                            - old_likes
+                        )
+
+                        print()
+                        print(
+                            "★ いいね増加検出"
+                        )
+
+                        print(
+                            f"  ユーザーID: {user_id}"
+                        )
+
+                        print(
+                            f"  作品: {title}"
+                        )
+
+                        print(
+                            f"  前回: {old_likes}"
+                        )
+
+                        print(
+                            f"  今回: {likes}"
+                        )
+
+                        print(
+                            f"  増加: +{increase}"
+                        )
+
+                        # ------------------------------------------------
+                        # 通知
+                        # ------------------------------------------------
+
+                        if create_notification(
+                            conn,
+                            user_id,
+                            title
+                        ):
+
+                            notification_count += 1
+
+            browser.close()
+
+        # ========================================================
+        # DB確定
+        # ========================================================
 
         conn.commit()
 
         print()
         print(
-            "notifications の変更をcommitしました。"
+            "DB commit完了"
         )
 
     # ========================================================
-    # 今回のデータをJSONへ保存
-    # ========================================================
-
-    new_state = {
-        "updated_at": fetched_at,
-        "users": {}
-    }
-
-    # --------------------------------------------------------
-    # ユーザーごとに保存
-    # --------------------------------------------------------
-
-    for user_id, urls in user_programs.items():
-
-        new_state["users"][user_id] = {
-            "programs": {}
-        }
-
-        for url in urls:
-
-            data = current_data.get(url)
-
-            if not data:
-                continue
-
-            if data["status"] != "success":
-                continue
-
-            new_state["users"][user_id][
-                "programs"
-            ][url] = {
-                "title": data.get(
-                    "title"
-                ),
-                "likes": data.get(
-                    "likes"
-                ),
-                "views": data.get(
-                    "views"
-                )
-            }
-
-    # --------------------------------------------------------
     # JSON保存
-    # --------------------------------------------------------
+    # ========================================================
 
     save_state(
         new_state
     )
 
     # ========================================================
-    # 結果
+    # 完了
     # ========================================================
 
     print()
@@ -776,27 +680,19 @@ def main():
     print("=" * 70)
 
     print(
-        f"ユーザー数: {len(user_programs)}"
+        f"ユーザー数: {len(users)}"
     )
 
     print(
-        f"作品URL数: {len(all_urls)}"
+        f"通知作成数: {notification_count}"
     )
 
     print(
-        f"作成通知数: {notification_count}"
-    )
-
-    print(
-        f"JSON: {STATE_FILE}"
+        f"保存ファイル: {STATE_FILE}"
     )
 
     print("=" * 70)
 
-
-# ============================================================
-# 実行
-# ============================================================
 
 if __name__ == "__main__":
     main()
