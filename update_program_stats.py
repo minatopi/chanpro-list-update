@@ -1007,28 +1007,21 @@ def git_push_state():
     GitHub Actions上で
     program_likes.jsonをcommit/pushする。
 
-    ローカル実行時に不要なら
-    AUTO_GIT_PUSH=0
+    AUTO_GIT_PUSH=0 の場合は無効。
+    GitHub Actions以外ではpushしない。
     """
 
     if not AUTO_GIT_PUSH:
-
         print()
-        print(
-            "GitHub自動pushは無効です。"
-        )
-
+        print("GitHub自動pushは無効です。")
         return
 
-    # GitHub Actionsでない場合
     if os.environ.get("GITHUB_ACTIONS") != "true":
-
         print()
         print(
             "GitHub Actionsではないため、"
             "自動pushをスキップします。"
         )
-
         return
 
     print()
@@ -1037,6 +1030,9 @@ def git_push_state():
     print("==================================================")
 
     try:
+        # --------------------------------------------------------
+        # Gitユーザー設定
+        # --------------------------------------------------------
 
         subprocess.run(
             [
@@ -1058,16 +1054,71 @@ def git_push_state():
             check=True
         )
 
+        # --------------------------------------------------------
+        # 現在のブランチ確認
+        # --------------------------------------------------------
+
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        branch = branch_result.stdout.strip()
+
+        # actions/checkoutではdetached HEADになることがあるため、
+        # GITHUB_REF_NAMEを使用
+        if not branch:
+            branch = os.environ.get(
+                "GITHUB_REF_NAME",
+                ""
+            ).strip()
+
+        if not branch:
+            branch = "main"
+
+        print(f"Push先ブランチ: {branch}")
+
+        # --------------------------------------------------------
+        # JSONファイルを強制的にstage
+        #
+        # .gitignoreに入っていても追加できるように -f を使用
+        # --------------------------------------------------------
+
         subprocess.run(
             [
                 "git",
                 "add",
+                "-f",
                 STATE_FILE
             ],
             check=True
         )
 
-        # 変更があるか確認
+        # --------------------------------------------------------
+        # Git状態確認
+        # --------------------------------------------------------
+
+        status_result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--short"
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        print()
+        print("Git status:")
+        print(status_result.stdout)
+
+        # --------------------------------------------------------
+        # stageされた変更があるか確認
+        # --------------------------------------------------------
+
         result = subprocess.run(
             [
                 "git",
@@ -1078,12 +1129,14 @@ def git_push_state():
         )
 
         if result.returncode == 0:
-
             print(
                 "program_likes.jsonに変更はありません。"
             )
-
             return
+
+        # --------------------------------------------------------
+        # commit
+        # --------------------------------------------------------
 
         commit_message = (
             "Update program like state "
@@ -1102,25 +1155,50 @@ def git_push_state():
             check=True
         )
 
-        subprocess.run(
+        # --------------------------------------------------------
+        # push
+        # --------------------------------------------------------
+
+        push_result = subprocess.run(
             [
                 "git",
-                "push"
+                "push",
+                "origin",
+                f"HEAD:{branch}"
             ],
-            check=True
+            capture_output=True,
+            text=True
         )
 
-        print(
-            "GitHubへのpush完了"
-        )
+        print()
+        print("git push stdout:")
+        print(push_result.stdout)
+
+        print("git push stderr:")
+        print(push_result.stderr)
+
+        if push_result.returncode != 0:
+            raise RuntimeError(
+                "git push failed: "
+                f"returncode={push_result.returncode}"
+            )
+
+        print()
+        print("GitHubへのpush完了")
 
     except Exception as e:
-
         print()
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print("GitHub push失敗")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print(e)
+        print()
+        print("原因:")
+        print(repr(e))
+        print()
+
+        # GitHub Actionsでは失敗として終了させる。
+        # これにより、push失敗を「処理完了」と誤認しない。
+        raise
 
 
 # ============================================================
