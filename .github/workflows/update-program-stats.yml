@@ -8,6 +8,10 @@ on:
   # GitHub画面から手動実行
   workflow_dispatch:
 
+# GitHub Actionsからリポジトリへpushする権限
+permissions:
+  contents: write
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -15,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,5 +39,6 @@ jobs:
       - name: Update program stats
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AUTO_GIT_PUSH: "1"
         run: |
           python update_program_stats.py
