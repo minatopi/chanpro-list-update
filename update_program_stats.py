@@ -704,7 +704,7 @@ def create_like_notification(
     notificationsに「いいね」通知を保存。
     """
 
-    message = f"「{title}」にいいねがされました"
+    message = f"{title}にいいねがされました"
 
     print()
     print("★ 通知作成")
@@ -729,7 +729,7 @@ def create_like_notification(
                 VALUES (
                     %s,
                     NULL,
-                    'like',
+                    'like-project',
                     NULL,
                     NOW(),
                     FALSE,
