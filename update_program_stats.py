@@ -315,60 +315,97 @@ def get_users(conn):
 # プロフィールカード解析
 # ============================================================
 
-def parse_card(text):
+def parse_card(card):
     """
-    プロフィールカードのテキストを解析。
+    実際に動作しているプロフィールカード取得コードに
+    できるだけ寄せた解析。
 
-    既存の動作していた方式をそのままベースにする。
+    カード全体から数字を拾わず、
+    inner_text() の「数字だけの行」を統計値として扱う。
 
-    例:
+    通常:
+        タイトル
+        Lv.10
+        1252
+        3045
 
-    じゃんけんゲーム
-    Lv.10
-    1252
-    3045
+        -> likes=1252, views=3045
 
-    ↓
+    いいね0で表示自体が空欄の場合:
+        タイトル
+        Lv.10
+        3045
 
-    title = じゃんけんゲーム
-    like  = 1252
-    views = 3045
+        -> likes=0, views=3045
     """
+
+    try:
+        text = card.inner_text()
+    except Exception as e:
+        print("カードinner_text取得失敗:", e)
+        return None
 
     lines = [
-        line.strip()
-        for line in text.split("\n")
-        if line.strip()
+        l.strip()
+        for l in text.split("\n")
+        if l.strip()
     ]
 
-    # 不要な文字を除外
+    # 元コードと同じ不要文字除外
     lines = [
-        line
-        for line in lines
-        if line not in ["ログイン"]
-        and not line.startswith("Lv.")
+        l for l in lines
+        if l not in ["ログイン"]
+        and not l.startswith("Lv.")
     ]
 
     if not lines:
         return None
 
+    # 元コードと同じく最初の行をタイトル
     title = lines[0]
 
-    # 数字取得
-    nums = re.findall(r"\d[\d,]*", text)
+    # --------------------------------------------------------
+    # 数字「だけ」の行を取得
+    #
+    # タイトル「テスト123」などは対象外。
+    # 1,234 のようなカンマ付き数字にも対応。
+    # --------------------------------------------------------
 
-    numbers = []
+    nums = []
 
-    for n in nums:
-        try:
-            numbers.append(
-                int(n.replace(",", ""))
-            )
-        except Exception:
-            pass
+    for line in lines[1:]:
+        value = line.replace(",", "").strip()
 
-    like_count = numbers[0] if len(numbers) >= 1 else 0
-    views_count = numbers[1] if len(numbers) >= 2 else 0
+        if re.fullmatch(r"\d+", value):
+            try:
+                nums.append(int(value))
+            except Exception:
+                pass
+
+    # --------------------------------------------------------
+    # 重要:
+    #
+    # likes=0 の場合、heart横のTextが空なので
+    # 「0」がinner_text()に出てこない。
+    #
+    # したがって数字が1個なら、
+    #   likes = 0
+    #   views = その数字
+    #
+    # 数字が2個なら、
+    #   likes = 1個目
+    #   views = 2個目
+    # --------------------------------------------------------
+
+    if len(nums) >= 2:
+        like_count = nums[0]
+        views_count = nums[1]
+    elif len(nums) == 1:
+        like_count = 0
+        views_count = nums[0]
+    else:
+        like_count = 0
+        views_count = 0
 
     return {
         "title": title,
@@ -479,7 +516,7 @@ def scrape_profile(page, profile_url):
                 print(f"--- CARD {i + 1} ---")
                 print(text)
 
-                parsed = parse_card(text)
+                parsed = parse_card(card)
 
                 if not parsed:
                     continue
@@ -805,47 +842,69 @@ def get_all_programs(conn):
 
 def get_number_from_icon(page, icon_name):
     """
-    #eyes / #heart のアイコンを探して、
-    同じGroupの中にある数字を取得。
+    #heart / #eyes のアイコンが入っている
+    直近のGroupだけを見る。
+
+    ページ全体の数字や「最後の数字」は使わない。
+
+    いいね0などでTextが空欄なら0を返す。
     """
 
     try:
-
         icon = page.locator(
             f'use[href*="#{icon_name}"]'
-        )
+        ).first
 
         if icon.count() == 0:
-            return None
+            print(f"{icon_name}: アイコンが見つかりません")
+            return 0
 
-        group = icon.first.locator(
+        # 元HTMLの構造:
+        #
+        # Group
+        #   button
+        #     svg
+        #       use #heart / #eyes
+        #   Text
+        #     数字
+        #
+        # この直近Groupだけを対象にする。
+        group = icon.locator(
             "xpath=ancestor::div[contains(@class, 'Group')][1]"
         )
 
         if group.count() == 0:
-            return None
+            print(f"{icon_name}: Groupが見つかりません")
+            return 0
 
         text = group.inner_text()
 
-        numbers = re.findall(
-            r"\d[\d,]*",
-            text
+        print(
+            f"{icon_name} group text: {text!r}"
         )
 
-        if not numbers:
-            return None
+        # 元の動作確認済みコードに寄せて
+        # inner_text()を行単位で解析する。
+        lines = [
+            l.strip()
+            for l in text.split("\n")
+            if l.strip()
+        ]
 
-        return int(
-            numbers[-1].replace(",", "")
-        )
+        for line in lines:
+            value = line.replace(",", "").strip()
+
+            if re.fullmatch(r"\d+", value):
+                return int(value)
+
+        # 数字がない = 0
+        return 0
 
     except Exception as e:
-
         print(
             f"{icon_name}取得エラー: {e}"
         )
-
-        return None
+        return 0
 
 
 def get_program_data(page, url):
