@@ -6,7 +6,7 @@ on:
    # - cron: "*/15 * * * *"
 
   # GitHub画面から手動実行
-  #workflow_dispatch:
+  workflow_dispatch:
 
 # GitHub Actionsからリポジトリへpushする権限
 permissions:
