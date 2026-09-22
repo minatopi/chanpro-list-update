@@ -1,7 +1,7 @@
 name: Update Program Stats
 
 on:
-  schedule:
+  #schedule:
     # 15分ごとに実行
    # - cron: "*/15 * * * *"
 
